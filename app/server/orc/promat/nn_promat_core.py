@@ -4,12 +4,13 @@ nn_promat_core.py
 Neural-Network PROMAT Core — shared instruction set for all ORC pipeline agents.
 
 Replaces the old additive weight system (+20, +15, -50 …) with a deterministic
-5-layer neural architecture.  Every decision is driven by signal activations,
-pattern logic, a cross-sheet dependency graph, hard firewalls, and a
-normalised confidence distribution.
+6-layer neural architecture.  Every decision is driven by signal activations,
+pattern logic, a cross-sheet dependency graph, hard firewalls, a normalised
+confidence distribution, and a final business arbitration layer.
 
 No numeric scores.  No keyword bonuses.  No additive penalties.
-Only binary signals → pattern logic → graph analysis → firewalls → softmax.
+Only binary signals → pattern logic → graph analysis → firewalls →
+softmax → business arbitration.
 
 Layer summary
 ─────────────
@@ -19,6 +20,7 @@ Layer summary
   L3  Context graph       — cross-sheet dependency analysis
   L4  Hard gates          — firewalls that permanently block a sheet
   L5  Confidence softmax  — normalised probability over passing sheets
+  L6  Business arbitration — bridges technical correctness to business correctness
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -226,15 +228,24 @@ A blocked sheet receives confidence = 0 in Layer 5.
 There is NO compensating evidence that overrides a fired gate.
 A sheet that triggers any gate is DISQUALIFIED — final, irreversible.
 
+NOTE: Layer 4 disqualifies sheets from the TECHNICAL path only.
+Layer 6 Business Arbitration may later reconsider sheets blocked by GATE_2
+if the block is classified as TECHNICAL (not CRITICAL).
+GATE_1, GATE_3, and GATE_4 are ALWAYS critical and can never be overridden.
+
 GATE_1  [HIDDEN FIREWALL]
   Condition: HIDDEN_SIGNAL = 1
   Action:    BLOCK — a hidden sheet can NEVER be the main sheet.
+  Disqualification class: CRITICAL — not overrideable by Layer 6.
 
 GATE_2  [NO COMPANY COLUMNS FIREWALL]
   Condition: COMPANY_COLUMN_SIGNAL = 0
              AND CONSOLIDATE_SIGNAL = 0
              AND consolidate (Layer 3, A4) = false
-  Action:    BLOCK — without company columns, this is not a FS sheet.
+  Action:    BLOCK — without company columns, this is not a FS sheet
+             under the technical definition.
+  Disqualification class: TECHNICAL — Layer 6 may override for REPORTING_FS
+             sheets that are semantically presentation-final.
   Exemption: sheets confirmed as CONSOLIDATE by Layer 3 A4 are exempt.
 
   CRITICAL NOTE: This gate is the primary defence against CF-type errors.
@@ -244,12 +255,14 @@ GATE_2  [NO COMPANY COLUMNS FIREWALL]
 GATE_3  [TRIAL BALANCE FIREWALL]
   Condition: TB_PATTERN = 1 (Layer 2)
   Action:    BLOCK — a TB / ledger sheet is a source, not an output.
+  Disqualification class: CRITICAL — not overrideable by Layer 6.
 
 GATE_4  [INCOMING-ONLY FIREWALL]
   Condition: role_in_graph = "TB" (Layer 3)
              AND FS_PATTERN = 0
              AND PARTIAL_FS_PATTERN = 0
   Action:    BLOCK — a pure source sheet without any FS signal is not main.
+  Disqualification class: CRITICAL — not overrideable by Layer 6.
 
 Gate evaluation order: GATE_1 → GATE_2 → GATE_3 → GATE_4.
 Stop at the first triggered gate; do not evaluate further gates.
@@ -297,6 +310,217 @@ Tie-breaking (two sheets within 0.10 of each other):
   Step 2: If still tied, choose the sheet with more COA_SIGNAL activations
           (count how many of the 7 required sections are present).
   Step 3: If still tied, flag for manual review.
+
+Layer 5 produces the TECHNICAL winner.
+Layer 6 then determines whether the business-correct winner differs.
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LAYER 6 — Business arbitration  (semantic bridge)
+# ──────────────────────────────────────────────────────────────────────────────
+
+NN_LAYER_6 = """
+╔══════════════════════════════════════════════════════════╗
+║  LAYER 6 — Business Arbitration (Semantic Bridge)       ║
+╚══════════════════════════════════════════════════════════╝
+
+Purpose:
+  Layer 6 resolves the gap between:
+    • technically correct main sheet  (L5 softmax winner)
+    • business-correct final reporting sheet  (what a finance user expects)
+
+  Layers 1–5 identify the strongest TECHNICAL winner.
+  Layer 6 decides whether that technical winner also matches the sheet a
+  finance user would call the main output.
+
+Key principle:
+  Do NOT weaken Layer-4 gates globally.
+  Instead, distinguish between:
+    • CRITICAL disqualification   → can NEVER be final main sheet
+    • TECHNICAL disqualification  → may still be business-correct
+
+The core insight:
+  A sheet that is the structural / computational hub of a workbook
+  (many outgoing refs, company columns, AJE signals) is not necessarily
+  the FINAL REPORTING OUTPUT a user cares about.
+  AJE = adjustment staging hub   ≠   Report = final presentation output.
+  Layer 6 resolves this conflict.
+
+──────────────────────────────────────────────────────────
+BUSINESS SIGNALS
+──────────────────────────────────────────────────────────
+
+CANONICAL_FS_TITLE_SIGNAL
+  ON if sheet_name or dominant title contains any of (case-insensitive):
+    "balance sheet" | "balance sheets" |
+    "statement of operations" | "statement of income" |
+    "profit and loss" | "p&l" |
+    "cash flow" | "cash flows" | "statement of cash flows" |
+    "change in equity" | "stockholders' equity" |
+    "financial statements" | "report"
+
+PRESENTATION_LAYOUT_SIGNAL
+  ON if the sheet appears to be a human-facing financial report rather than
+  a staging / journal / source sheet.
+  Typical evidence:
+    • readable financial line items
+    • period / year labels
+    • statement-style sections
+    • no raw journal-entry structure
+    • no source-ledger code-column dominance
+
+STAGING_SHEET_SIGNAL
+  ON if sheet_name, headers, or dominant structure indicates:
+    "aje" | "adjusting" | "adjustments" | "elimination" |
+    "mapping" | "bridge" | "rollforward" | "support" | "schedule"
+
+FINAL_OUTPUT_ROLE_SIGNAL
+  ON if the sheet is likely the human-facing final output sheet.
+  Typical evidence:
+    • canonical FS title
+    • presentation layout
+    • report-style formatting / headings
+    • appears downstream from adjustment / source sheets
+
+──────────────────────────────────────────────────────────
+SHEET TYPE CLASSIFIER
+──────────────────────────────────────────────────────────
+
+Assign exactly one sheet_type per sheet.
+Apply rules in the following priority order — first match wins:
+
+  SOURCE_TB
+    If TB_PATTERN = 1
+    OR role_in_graph = "TB" and source-sheet structure dominates
+
+  REPORTING_FS (when FS_PATTERN = 1)
+    If FS_PATTERN = 1 AND sheet name does NOT explicitly mark it as
+    a staging layer (i.e., name does not contain "aje", "adjusting",
+    "adjustments", "elimination").
+    IMPORTANT: FS_PATTERN = 1 is checked BEFORE AJE_SIGNAL.
+    A consolidation FS sheet may contain an "AJE" adjustment column
+    internally — that does NOT make the sheet itself a staging layer.
+    Only a sheet explicitly named as staging (e.g., named "AJE") is
+    demoted to ADJUSTMENT_STAGING when FS_PATTERN = 1.
+
+  ADJUSTMENT_STAGING (only when FS_PATTERN = 0)
+    If AJE_SIGNAL = 1
+    OR STAGING_SHEET_SIGNAL = 1
+    OR the sheet name/title contains "aje", "adjusting", "adjustments",
+       "elimination", "mapping", "bridge", "rollforward", "support",
+       "schedule"
+
+  REPORTING_FS (when FS_PATTERN = 0 but strong title evidence)
+    If sheet name or title contains a STRONG canonical FS keyword:
+      "balance sheet" | "balance sheets" |
+      "statement of operations" | "statement of income" |
+      "profit and loss" | "p&l" |
+      "cash flow" | "cash flows" | "statement of cash flows" |
+      "change in equity" | "stockholders' equity" | "financial statements"
+    OR contains the WEAK keyword "report" AND COA_SIGNAL = 1.
+    NOTE: "report" alone (without COA evidence) is insufficient —
+    it is too common in dashboard and summary sheets.
+
+  INTERMEDIATE_CONSOLIDATION
+    If consolidate = true
+    OR the sheet sits in FS → INTERMEDIATE → TB chains
+
+  AUXILIARY_SCHEDULE
+    If COA_SIGNAL = 1 but CROSS_REF_SIGNAL = 0 (no outgoing references)
+
+  UNKNOWN
+    Otherwise
+
+──────────────────────────────────────────────────────────
+DISQUALIFICATION CLASS
+──────────────────────────────────────────────────────────
+
+Assign exactly one disqualification class per sheet:
+
+  CRITICAL
+    If blocked_by ∈ { GATE_1, GATE_3, GATE_4 }
+    These sheets can NEVER be final main sheet — no override possible.
+
+  TECHNICAL
+    If blocked_by = GATE_2 only
+    AND the sheet shows strong REPORTING_FS evidence.
+    Example: canonical report sheet missing company columns.
+    Layer 6 may override this block when other semantic conditions hold.
+
+  NONE
+    If layer4.passed = true (no gate fired)
+
+──────────────────────────────────────────────────────────
+BUSINESS ARBITRATION RULES
+──────────────────────────────────────────────────────────
+
+BA1 — Technical winner
+  The highest-confidence passing sheet from Layer 5 is the technical winner.
+
+BA2 — Business winner candidate
+  Search all visible sheets for the strongest REPORTING_FS candidate.
+
+BA3 — Safe override condition
+  Override the technical winner with the business winner ONLY if ALL
+  of the following are true:
+
+    1. technical_winner.sheet_type is "ADJUSTMENT_STAGING"
+       OR "INTERMEDIATE_CONSOLIDATION"
+
+    2. business_candidate.sheet_type = "REPORTING_FS"
+
+    3. business_candidate.disqualification_class = "TECHNICAL"
+       OR business_candidate.disqualification_class = "NONE"
+
+    4. business_candidate is NOT blocked by GATE_1, GATE_3, or GATE_4
+
+    5. business_candidate shows FINAL_OUTPUT_ROLE_SIGNAL = 1
+       (is clearly the human-facing FS output)
+
+BA4 — No unsafe override
+  Never override to a sheet that is:
+    • SOURCE_TB
+    • hidden (GATE_1)
+    • trial balance (GATE_3)
+    • pure incoming-only source (GATE_4)
+
+BA5 — Dual truth preservation
+  If BA3 conditions are met (override applies):
+    technical_main_sheet = technical winner    (preserved for traceability)
+    business_main_sheet  = reporting candidate
+    final_main_sheet     = business_main_sheet
+    decision_mode        = "business_override"
+
+  Otherwise (no override):
+    technical_main_sheet = technical winner
+    business_main_sheet  = technical winner
+    final_main_sheet     = technical winner
+    decision_mode        = "technical_default"
+
+──────────────────────────────────────────────────────────
+LAYER 6 OUTPUT
+──────────────────────────────────────────────────────────
+
+  {
+    "technical_main_sheet":  "<sheet>" | null,
+    "business_main_sheet":   "<sheet>" | null,
+    "final_main_sheet":      "<sheet>" | null,
+    "decision_mode":         "technical_default" | "business_override" | "no_valid_sheet",
+    "sheet_types": {
+      "<sheet>": "REPORTING_FS|ADJUSTMENT_STAGING|SOURCE_TB|INTERMEDIATE_CONSOLIDATION|AUXILIARY_SCHEDULE|UNKNOWN"
+    },
+    "disqualification_classes": {
+      "<sheet>": "CRITICAL|TECHNICAL|NONE"
+    },
+    "business_arbitration": {
+      "technical_winner_sheet_type": "...",
+      "business_candidate": "<sheet>" | null,
+      "business_candidate_sheet_type": "...",
+      "business_candidate_blocked_by": "<gate>" | null,
+      "business_candidate_disqualification_class": "CRITICAL|TECHNICAL|NONE|null",
+      "override_applied": true/false
+    }
+  }
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -305,7 +529,7 @@ Tie-breaking (two sheets within 0.10 of each other):
 
 NN_DECISION_PROTOCOL = """
 ╔══════════════════════════════════════════════════════════╗
-║  DECISION PROTOCOL — Full 5-Layer Execution             ║
+║  DECISION PROTOCOL — Full 6-Layer Execution             ║
 ╚══════════════════════════════════════════════════════════╝
 
 Execute these steps in strict order for every sheet in the workbook:
@@ -317,24 +541,36 @@ Execute these steps in strict order for every sheet in the workbook:
                Assign role_in_graph to every sheet.
                Detect CONSOLIDATE (A4) and intermediate sheets (A3).
   Step 5 — L4: Apply GATE_1 through GATE_4.
-               Any triggered gate → permanent disqualification.
+               Any triggered gate → permanent technical disqualification.
+               Record blocked_by for each disqualified sheet.
   Step 6 — L5: Compute S(sheet) and softmax confidence for passing sheets.
-  Step 7 — Decision: select the sheet with highest confidence.
-               Apply thresholds. Produce final answer.
+               Identify the TECHNICAL winner.
+  Step 7 — L6: Run business arbitration.
+               Classify every sheet into a sheet_type.
+               Classify every blocked sheet into a disqualification_class.
+               If the technical winner is ADJUSTMENT_STAGING or
+               INTERMEDIATE_CONSOLIDATION, search for a REPORTING_FS
+               candidate blocked only by a TECHNICAL gate.
+               If safe override conditions (BA3) hold → apply override.
+  Step 8 — Decision: emit final_main_sheet, technical_main_sheet,
+               business_main_sheet, decision_mode.
 
 Output contract:
   {
-    "main_sheet_exists":   true/false,
-    "main_sheet_name":     "<sheet name>" | null,
-    "confidence":          0.0 – 1.0,
-    "runner_up":           "<sheet name>" | null,
-    "main_source_sheet":   "<TB sheet name>" | null,
-    "nn_layers":           { ... full layer evidence ... }
+    "main_sheet_exists":    true/false,
+    "main_sheet_name":      "<final sheet name>" | null,
+    "technical_main_sheet": "<sheet name>" | null,
+    "business_main_sheet":  "<sheet name>" | null,
+    "decision_mode":        "technical_default" | "business_override" | "no_valid_sheet",
+    "confidence":           0.0 – 1.0,
+    "runner_up":            "<sheet name>" | null,
+    "main_source_sheet":    "<TB sheet name>" | null,
+    "nn_layers":            { ... full layer evidence including L6 ... }
   }
 
 Detector override rule:
   The heuristic detector result is a CANDIDATE HINT only.
-  It must pass all 5 NN layers independently.
+  It must pass all NN layers independently.
   If the detector's candidate fails any gate → it is blocked,
   and the NN winner is returned instead.
   Never return the detector result without NN validation.
@@ -346,10 +582,11 @@ Detector override rule:
 
 FULL_NN_PROMAT = f"""
 {'═' * 62}
-  NEURAL PROMAT SYSTEM  v2.0
-  Replaces all additive scoring with a 5-layer neural architecture.
+  NEURAL PROMAT SYSTEM  v3.0
+  6-layer neural architecture with business arbitration.
   No weights.  No bonuses.  No penalties.
-  Binary signals → pattern logic → graph → firewalls → softmax.
+  Binary signals → pattern logic → graph → firewalls →
+  softmax → business arbitration.
 {'═' * 62}
 
 {NN_LAYER_0}
@@ -363,6 +600,8 @@ FULL_NN_PROMAT = f"""
 {NN_LAYER_4}
 
 {NN_LAYER_5}
+
+{NN_LAYER_6}
 
 {NN_DECISION_PROTOCOL}
 """
