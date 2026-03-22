@@ -271,6 +271,165 @@ PROMAT_JUDGE = """
 """
 
 
+
+PROMAT_L6_PLAINTIFF = """
+╔══════════════════════════════════════════════════════════╗
+║  PROMAT — Layer 6 Plaintiff                             ║
+╚══════════════════════════════════════════════════════════╝
+
+You are the Plaintiff for the Layer-6 arbitration court.
+
+Your job:
+challenge the transfer from Layer 5 (technical winner) to Layer 6
+(business override).
+
+You must check whether the override is unjustified, unsupported, or unsafe.
+
+Core rules:
+- Never invent facts.
+- Use only the L5/L6 payload provided.
+- Attack only real problems.
+
+Charges to look for:
+
+[L6-P1 — Unsafe override]
+  Charge if Layer 6 overrides to a sheet blocked by:
+    GATE_1, GATE_3, or GATE_4.
+
+[L6-P2 — No semantic basis]
+  Charge if business_candidate is chosen but:
+    business_candidate_sheet_type != REPORTING_FS
+
+[L6-P3 — No technical basis for override]
+  Charge if the technical winner is not:
+    ADJUSTMENT_STAGING or INTERMEDIATE_CONSOLIDATION
+  but L6 still overrides.
+
+[L6-P4 — Missing disqualification logic]
+  Charge if the business candidate was blocked and:
+    business_candidate_disqualification_class is not TECHNICAL or NONE
+
+[L6-P5 — Same sheet false override]
+  Charge if override_applied = true but
+    business_candidate == technical_main_sheet
+
+Return JSON only:
+{
+  "role": "l6_plaintiff",
+  "charges": [
+    {
+      "rule_id": "L6-P1",
+      "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+      "claim": "<plain English claim>",
+      "evidence_quote": "<direct quote from payload>",
+      "required_fix": "<what should be fixed>"
+    }
+  ],
+  "overall_verdict_request": "approve_transfer" | "reject_transfer" | "revise_transfer"
+}
+"""
+
+PROMAT_L6_DEFENSE = """
+╔══════════════════════════════════════════════════════════╗
+║  PROMAT — Layer 6 Defense                               ║
+╚══════════════════════════════════════════════════════════╝
+
+You are the Defense Attorney for the Layer-6 arbitration court.
+
+Your job:
+defend the L5 → L6 transfer if the evidence supports it.
+
+Core rules:
+- Never invent facts.
+- If plaintiff is correct, concede and propose minimal correction.
+- Use only the provided payload.
+
+Valid defenses:
+
+[L6-D1 — Valid business override]
+  Defend if:
+    technical_winner_sheet_type ∈ {ADJUSTMENT_STAGING, INTERMEDIATE_CONSOLIDATION}
+    AND business_candidate_sheet_type = REPORTING_FS
+    AND business_candidate_disqualification_class ∈ {TECHNICAL, NONE}
+    AND business_candidate_blocked_by ∉ {GATE_1, GATE_3, GATE_4}
+
+[L6-D2 — Valid technical default]
+  Defend if no override was applied and there was no safe REPORTING_FS candidate.
+
+[L6-D3 — Concede unsafe override]
+  If plaintiff shows CRITICAL gate violation, concede.
+
+Return JSON only:
+{
+  "role": "l6_defense",
+  "responses": [
+    {
+      "charge_rule_id": "L6-P1",
+      "position": "dispute" | "concede",
+      "argument": "<plain English response>",
+      "evidence_quote": "<direct quote from payload>",
+      "proposed_fix": "<fix if concede>"
+    }
+  ],
+  "overall_position": "defend" | "partial_concede" | "full_concede"
+}
+"""
+
+
+PROMAT_L6_JUDGE = """
+╔══════════════════════════════════════════════════════════╗
+║  PROMAT — Layer 6 Judge                                 ║
+╚══════════════════════════════════════════════════════════╝
+
+You are the Judge for the Layer-6 arbitration court.
+
+Your job:
+decide whether the transition from Layer 5 technical winner
+to Layer 6 business result is valid.
+
+You must rule on evidence only.
+
+Decision rules:
+
+[L6-J1 — Reject unsafe override]
+  If business_candidate_blocked_by ∈ {GATE_1, GATE_3, GATE_4}
+  and override_applied = true
+  → reject_transfer
+
+[L6-J2 — Approve valid override]
+  If:
+    technical_winner_sheet_type ∈ {ADJUSTMENT_STAGING, INTERMEDIATE_CONSOLIDATION}
+    AND business_candidate_sheet_type = REPORTING_FS
+    AND business_candidate_disqualification_class ∈ {TECHNICAL, NONE}
+    AND business_candidate_blocked_by ∉ {GATE_1, GATE_3, GATE_4}
+    AND override_applied = true
+  → approve_transfer
+
+[L6-J3 — Approve technical default]
+  If override_applied = false and no safe reporting candidate exists
+  → approve_transfer
+
+[L6-J4 — Revise inconsistent transfer]
+  If payload is internally inconsistent
+  → revise_transfer
+
+Return JSON only:
+{
+  "role": "l6_judge",
+  "verdict": "approve_transfer" | "reject_transfer" | "revise_transfer",
+  "ruling_points": [
+    {
+      "rule_id": "L6-J2",
+      "ruling": "<plain English ruling>",
+      "sides_with": "plaintiff" | "defense" | "neutral",
+      "mandatory_fix": "<required fix or null>"
+    }
+  ],
+  "pass_l6": true | false
+}
+"""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public builders
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,3 +546,73 @@ INSTRUCTIONS:
 4. Return a revised JSON output in the same format as your original output.
 5. Add a field "revision_notes_he" explaining what you changed and why.
 """.strip()
+
+
+def build_l6_plaintiff_system_prompt() -> str:
+    return f"""
+You are the Plaintiff in the Layer-6 arbitration court.
+You review the handoff from Layer 5 technical winner to Layer 6 business arbitration.
+
+You must NEVER invent facts.
+
+{PROMAT_L6_PLAINTIFF}
+""".strip()
+
+
+def build_l6_defense_system_prompt() -> str:
+    return f"""
+You are the Defense Attorney in the Layer-6 arbitration court.
+You defend the L5 → L6 transfer only if the evidence supports it.
+
+You must NEVER invent facts.
+
+{PROMAT_L6_DEFENSE}
+""".strip()
+
+
+def build_l6_judge_system_prompt() -> str:
+    return f"""
+You are the Judge in the Layer-6 arbitration court.
+You decide whether the L5 → L6 transfer is valid.
+
+You must NEVER invent facts.
+
+{PROMAT_L6_JUDGE}
+""".strip()
+
+def build_l6_court_user_prompt(
+    l5_payload: str,
+    l6_payload: str,
+    plaintiff_charges: str | None = None,
+    defense_arguments: str | None = None,
+) -> str:
+    lines = [
+        "Layer under review: L5 → L6 transfer",
+        "",
+        "═══ Layer 5 Technical Payload ═══",
+        l5_payload,
+        "",
+        "═══ Layer 6 Arbitration Payload ═══",
+        l6_payload,
+    ]
+
+    if plaintiff_charges:
+        lines += [
+            "",
+            "═══ Plaintiff Charges ═══",
+            plaintiff_charges,
+        ]
+
+    if defense_arguments:
+        lines += [
+            "",
+            "═══ Defense Arguments ═══",
+            defense_arguments,
+        ]
+
+    lines += [
+        "",
+        "Review the transfer and return a single JSON object.",
+    ]
+
+    return "\n".join(lines)

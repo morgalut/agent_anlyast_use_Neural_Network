@@ -11,6 +11,9 @@ from app.server.orc.promat.court_prompt import (
     build_plaintiff_system_prompt,
     build_defense_system_prompt,
     build_judge_system_prompt,
+    build_l6_plaintiff_system_prompt,
+    build_l6_defense_system_prompt,
+    build_l6_judge_system_prompt,
 )
 from app.tools.tools import (
     detect_main_sheet,
@@ -151,4 +154,46 @@ def build_judge_agent():
         tools=[],
         system_prompt=build_judge_system_prompt(),
         name="judge_agent",
+    )
+    
+def build_l6_plaintiff_agent():
+    """
+    Layer-6 Plaintiff LLM — temperature 0.1.
+    Reviews the L5 → L6 transfer and tries to prove that the business override
+    is invalid, unsupported, or unsafe.
+    """
+    llm = _make_llm(0.1)
+    return create_agent(
+        model=llm,
+        tools=[],
+        system_prompt=build_l6_plaintiff_system_prompt(),
+        name="l6_plaintiff_agent",
+    )
+
+
+def build_l6_defense_agent():
+    """
+    Layer-6 Defense Attorney LLM — temperature 0.7.
+    Defends the L5 → L6 transfer, but may not invent facts.
+    """
+    llm = _make_llm(0.7)
+    return create_agent(
+        model=llm,
+        tools=[],
+        system_prompt=build_l6_defense_system_prompt(),
+        name="l6_defense_agent",
+    )
+
+
+def build_l6_judge_agent():
+    """
+    Layer-6 Judge LLM — temperature 0.4.
+    Decides whether the L5 → L6 transfer is valid.
+    """
+    llm = _make_llm(0.4)
+    return create_agent(
+        model=llm,
+        tools=[],
+        system_prompt=build_l6_judge_system_prompt(),
+        name="l6_judge_agent",
     )

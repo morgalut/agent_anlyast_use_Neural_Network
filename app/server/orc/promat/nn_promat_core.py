@@ -8,7 +8,10 @@ Replaces the old additive weight system (+20, +15, -50 …) with a deterministic
 pattern logic, a cross-sheet dependency graph, hard firewalls, a normalised
 confidence distribution, and a final business arbitration layer.
 
-No numeric scores.  No keyword bonuses.  No additive penalties.
+Deterministic layered reasoning:
+binary technical signals → pattern logic → graph analysis → hard gates →
+technical confidence normalisation → business/presentation arbitration.
+Critical gates remain absolute. Semantic logic only ranks safe candidates.
 Only binary signals → pattern logic → graph analysis → firewalls →
 softmax → business arbitration.
 
@@ -557,15 +560,25 @@ Execute these steps in strict order for every sheet in the workbook:
 
 Output contract:
   {
-    "main_sheet_exists":    true/false,
-    "main_sheet_name":      "<final sheet name>" | null,
-    "technical_main_sheet": "<sheet name>" | null,
-    "business_main_sheet":  "<sheet name>" | null,
-    "decision_mode":        "technical_default" | "business_override" | "no_valid_sheet",
-    "confidence":           0.0 – 1.0,
-    "runner_up":            "<sheet name>" | null,
-    "main_source_sheet":    "<TB sheet name>" | null,
-    "nn_layers":            { ... full layer evidence including L6 ... }
+    "technical_main_sheet":    "<sheet>" | null,
+    "presentation_main_sheet": "<sheet>" | null,
+    "business_main_sheet":     "<sheet>" | null,
+    "final_main_sheet":        "<sheet>" | null,
+    "decision_mode":           "technical_default" | "business_override" | "no_valid_sheet",
+    "sheet_types": {
+      "<sheet>": "REPORTING_FS|ADJUSTMENT_STAGING|SOURCE_TB|INTERMEDIATE_CONSOLIDATION|AUXILIARY_SCHEDULE|UNKNOWN"
+    },
+    "disqualification_classes": {
+      "<sheet>": "CRITICAL|TECHNICAL|NONE"
+    },
+    "business_arbitration": {
+      "technical_winner_sheet_type": "...",
+      "presentation_candidate": "<sheet>" | null,
+      "presentation_candidate_sheet_type": "...",
+      "presentation_candidate_blocked_by": "<gate>" | null,
+      "presentation_candidate_disqualification_class": "CRITICAL|TECHNICAL|NONE|null",
+      "override_applied": true/false
+    }
   }
 
 Detector override rule:

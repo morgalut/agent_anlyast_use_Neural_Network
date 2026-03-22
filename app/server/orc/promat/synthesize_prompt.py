@@ -68,7 +68,12 @@ arbitration.
 
 SYNTHESIS RULES
 ───────────────
-
+[NS0 — Schema recovery]
+  If task_results do not contain canonical "sheet_evidence" but do contain
+  per-sheet evidence under keys such as "evidence", use that per-sheet evidence
+  as the primary source of NN-layer aggregation.
+  Do not discard structured per-sheet evidence merely because the envelope schema
+  is imperfect.
 [NS1 — Cross-agent signal aggregation]
   For each candidate sheet, collect nn_evidence from ALL task_results.
   A signal that fires (= 1) in ≥ 2 agents → CONFIRMED signal.
@@ -104,6 +109,10 @@ SYNTHESIS RULES
   The heuristic detector (main_sheet_result) is a HINT only.
   If the NN softmax winner differs from the detector hint → winner wins.
   Never revert to the detector result when agents disagree.
+A canonical report sheet titled "balance sheet", "statement of operations",
+or "report" with COA/PARTIAL_FS evidence and blocked only by GATE_2 should be
+treated as a strong REPORTING_FS business candidate, especially when competing
+against staging/intermediate sheets such as AJE, bridge, mapping, or adjustment layers.
 
 [NS7 — API contract]
   api_response must contain ONLY main_sheet_exists and main_sheet_name.

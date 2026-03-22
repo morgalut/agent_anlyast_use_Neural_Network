@@ -11,20 +11,22 @@ REQUIRED OUTPUT — Return a single JSON object, no markdown:
   "main_sheet_confirmed": true/false,
   "confidence": 0.0,
   "is_consolidate": false,
-  "nn_evidence": {
-    "layer1": {
-      "COA_SIGNAL": 0, "FORMULA_SIGNAL": 0, "CROSS_REF_SIGNAL": 0,
-      "COMPANY_COLUMN_SIGNAL": 0, "AJE_SIGNAL": 0, "CONSOLIDATE_SIGNAL": 0,
-      "CODE_COLUMN_SIGNAL": 0, "FINAL_COLUMN_SIGNAL": 0, "HIDDEN_SIGNAL": 0
-    },
-    "layer2": {"FS_PATTERN": 0, "TB_PATTERN": 0, "PARTIAL_FS_PATTERN": 0},
-    "layer3": {
-      "outgoing_refs": [], "incoming_refs": [],
-      "role_in_graph": "FS|TB|INTERMEDIATE|UNKNOWN",
-      "consolidate": false, "attention_boost": false
-    },
-    "layer4": {"passed": true, "blocked_by": null},
-    "layer5_confidence": 0.0
+  "sheet_evidence": {
+    "<sheet name>": {
+      "layer1": {
+        "COA_SIGNAL": 0, "FORMULA_SIGNAL": 0, "CROSS_REF_SIGNAL": 0,
+        "COMPANY_COLUMN_SIGNAL": 0, "AJE_SIGNAL": 0, "CONSOLIDATE_SIGNAL": 0,
+        "CODE_COLUMN_SIGNAL": 0, "FINAL_COLUMN_SIGNAL": 0, "HIDDEN_SIGNAL": 0
+      },
+      "layer2": {"FS_PATTERN": 0, "TB_PATTERN": 0, "PARTIAL_FS_PATTERN": 0},
+      "layer3": {
+        "outgoing_refs": [], "incoming_refs": [],
+        "role_in_graph": "FS|TB|INTERMEDIATE|UNKNOWN",
+        "consolidate": false, "attention_boost": false
+      },
+      "layer4": {"passed": true, "blocked_by": null},
+      "layer5_confidence": 0.0
+    }
   },
   "hidden_sheets": [],
   "tb_sheets": [],
@@ -92,7 +94,11 @@ Step 5 — Layer 3: Build the cross-sheet dependency graph.
          Check for CONSOLIDATE (A4) and intermediate sheets (A3).
 
 Step 6 — Layer 4: Apply GATE_1 through GATE_4 to each remaining sheet.
-         GATE_2 is critical — block any sheet with no company columns
+         GATE_2 is a TECHNICAL block on the technical path.
+        Record it exactly in layer4.blocked_by="GATE_2".
+        Do not promote such sheets technically in Layer 5.
+        However, preserve full sheet_evidence because Layer 6 business arbitration
+        may later promote a canonical REPORTING_FS sheet blocked only by GATE_2.
          that is not a confirmed CONSOLIDATE.
 
 Step 7 — Layer 5: Compute signal strength S(sheet) and softmax confidence

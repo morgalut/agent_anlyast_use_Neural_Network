@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -112,12 +111,16 @@ def _extract_nn_evidence(state, sheet_name: str | None) -> dict:
             # Layer 3 graph
             "role_in_graph":         l3.get("role_in_graph", "UNKNOWN"),
             "consolidate":           bool(l3.get("consolidate", False)),
+            "attention_boost":       bool(l3.get("attention_boost", False)),
+            "outgoing_refs":         l3.get("outgoing_refs", []),
+            "incoming_refs":         l3.get("incoming_refs", []),
             # Layer 4 gates
             "gate_passed":           bool(l4.get("passed", True)),
             "blocked_by":            l4.get("blocked_by"),
             # Layer 5 confidence — already float 0-1 in new schema
-            "confidence":            float(nn.get("layer5_confidence", 0.0)
-                                           or parsed.get("confidence", 0.0)),
+            "confidence":            float(
+                nn.get("layer5_confidence", 0.0) or parsed.get("confidence", 0.0)
+            ),
         }
 
     return {}
@@ -143,7 +146,6 @@ def _format_nn_evidence(ev: dict) -> list[str]:
     if not ev:
         return ["  *No NN evidence available for this sheet.*"]
     lines = []
-    # Layer 1
     l1_signals = {
         "COA_SIGNAL":            ev.get("COA_SIGNAL"),
         "COMPANY_COLUMN_SIGNAL": ev.get("COMPANY_COLUMN_SIGNAL"),
@@ -161,20 +163,27 @@ def _format_nn_evidence(ev: dict) -> list[str]:
         lines.append(f"  - **L1 active signals**: `{'` `'.join(fired)}`")
     if silent:
         lines.append(f"  - L1 silent signals: `{'` `'.join(silent)}`")
-    # Layer 2
+
     if ev.get("FS_PATTERN") is not None:
         pat = []
-        if ev.get("FS_PATTERN"):        pat.append("FS_PATTERN ✓")
-        if ev.get("TB_PATTERN"):        pat.append("TB_PATTERN ✓")
-        if ev.get("PARTIAL_FS_PATTERN"): pat.append("PARTIAL_FS_PATTERN ✓")
+        if ev.get("FS_PATTERN"):
+            pat.append("FS_PATTERN ✓")
+        if ev.get("TB_PATTERN"):
+            pat.append("TB_PATTERN ✓")
+        if ev.get("PARTIAL_FS_PATTERN"):
+            pat.append("PARTIAL_FS_PATTERN ✓")
         lines.append(f"  - L2 patterns: {', '.join(pat) or 'none fired'}")
-    # Layer 3
+
     if ev.get("role_in_graph"):
         lines.append(f"  - L3 graph role: `{ev['role_in_graph']}`")
-    # Layer 4
+    if ev.get("outgoing_refs"):
+        lines.append(f"  - L3 outgoing refs: `{', '.join(ev['outgoing_refs'])}`")
+    if ev.get("incoming_refs"):
+        lines.append(f"  - L3 incoming refs: `{', '.join(ev['incoming_refs'])}`")
+
     gate_status = "✓ passed" if ev.get("gate_passed") else f"✗ blocked ({ev.get('blocked_by')})"
     lines.append(f"  - L4 gate: {gate_status}")
-    # Layer 5
+
     if ev.get("confidence") is not None:
         lines.append(f"  - L5 confidence: `{ev['confidence']:.3f}`")
     return lines
@@ -199,6 +208,237 @@ def _format_business_arbitration_block(ba: dict) -> list[str]:
     return lines
 
 
+def _signal_reason_lines(ev: dict) -> list[str]:
+    if not ev:
+        return ["- No signal evidence was available for the selected sheet."]
+
+    lines: list[str] = []
+
+    if ev.get("COA_SIGNAL") == 1:
+        lines.append("- `COA_SIGNAL` fired because the sheet looked like a financial statement structure rather than a raw ledger.")
+    else:
+        lines.append("- `COA_SIGNAL` did not fire, so the sheet did not strongly present financial-statement section structure.")
+
+    if ev.get("FORMULA_SIGNAL") == 1:
+        lines.append("- `FORMULA_SIGNAL` fired because the sheet contains formulas, meaning it is computed rather than purely static.")
+    else:
+        lines.append("- `FORMULA_SIGNAL` did not fire, so the sheet did not show calculation-based aggregation evidence.")
+
+    if ev.get("CROSS_REF_SIGNAL") == 1:
+        lines.append("- `CROSS_REF_SIGNAL` fired because the sheet references other sheets, which supports a synthesis/output role.")
+    else:
+        lines.append("- `CROSS_REF_SIGNAL` did not fire, so the sheet did not show outward workbook dependency evidence.")
+
+    if ev.get("COMPANY_COLUMN_SIGNAL") == 1:
+        lines.append("- `COMPANY_COLUMN_SIGNAL` fired because company/entity-style columns were detected.")
+    else:
+        lines.append("- `COMPANY_COLUMN_SIGNAL` did not fire, which weakens the case for the sheet being a standard FS output.")
+
+    if ev.get("AJE_SIGNAL") == 1:
+        lines.append("- `AJE_SIGNAL` fired, which suggests adjustment-related content was present.")
+    else:
+        lines.append("- `AJE_SIGNAL` did not fire, so there was no strong adjustment-sheet indicator.")
+
+    if ev.get("CONSOLIDATE_SIGNAL") == 1:
+        lines.append("- `CONSOLIDATE_SIGNAL` fired, which supports a consolidation-oriented interpretation.")
+    else:
+        lines.append("- `CONSOLIDATE_SIGNAL` did not fire, so consolidation wording was not a major factor.")
+
+    if ev.get("CODE_COLUMN_SIGNAL") == 1:
+        lines.append("- `CODE_COLUMN_SIGNAL` fired, which is typical of source/TB sheets and works against final-FS classification.")
+    else:
+        lines.append("- `CODE_COLUMN_SIGNAL` did not fire, which supports the sheet not being a raw code-ledger source.")
+
+    if ev.get("FINAL_COLUMN_SIGNAL") == 1:
+        lines.append("- `FINAL_COLUMN_SIGNAL` fired, which is often associated with TB-style source sheets.")
+    else:
+        lines.append("- `FINAL_COLUMN_SIGNAL` did not fire, so there was no strong TB-final-column signature.")
+
+    if ev.get("HIDDEN_SIGNAL") == 1:
+        lines.append("- `HIDDEN_SIGNAL` fired, which is a direct blocker for main-sheet candidacy.")
+    else:
+        lines.append("- `HIDDEN_SIGNAL` did not fire, so visibility was not a blocker.")
+
+    return lines
+
+
+def _layer_explanation_block(
+    chosen: str | None,
+    chosen_ev: dict,
+    final_parsed: dict,
+) -> list[str]:
+    lines: list[str] = ["## Layer-by-layer explanation", ""]
+
+    if not chosen:
+        lines += [
+            "No final sheet was selected, so the layer-by-layer explanation is limited to the final blocked state.",
+            "",
+        ]
+        return lines
+
+    lines += [
+        f"The explanations below are generated **after the full pipeline completed**, using the final verified state for **`{chosen}`**.",
+        "",
+        "### L0 — Raw extraction",
+        (
+            "L0 gathered the workbook-level evidence first: sheet names, headers, values, formulas, "
+            "cross-sheet references, visibility, and active-sheet context. "
+            "This layer does not decide; it only collects raw workbook facts for all later layers."
+        ),
+        "",
+        "### L1 — Binary signals",
+        "L1 converted raw workbook evidence into binary signals that the later layers can reason over.",
+    ]
+    lines += _signal_reason_lines(chosen_ev)
+    lines += [""]
+
+    l2_expl = []
+    if chosen_ev.get("FS_PATTERN") == 1:
+        l2_expl.append(
+            "L2 chose `FS_PATTERN` because the selected sheet matched the full financial-statement signature "
+            "(statement-like structure + formula behavior + cross-sheet references + company/entity evidence "
+            "+ no hidden/source-sheet conflict)."
+        )
+    if chosen_ev.get("TB_PATTERN") == 1:
+        l2_expl.append(
+            "L2 chose `TB_PATTERN`, meaning the sheet behaved like a trial balance / source ledger rather than a final output."
+        )
+    if chosen_ev.get("PARTIAL_FS_PATTERN") == 1:
+        l2_expl.append(
+            "L2 chose `PARTIAL_FS_PATTERN`, meaning the sheet showed incomplete but meaningful FS evidence and needed deeper graph validation."
+        )
+    if not l2_expl:
+        l2_expl.append(
+            "L2 did not find a strong composite pattern, so later layers had to rely more on graph position, gates, and arbitration."
+        )
+
+    lines += ["### L2 — Pattern logic"]
+    lines += l2_expl
+    lines += [""]
+
+    role = chosen_ev.get("role_in_graph", "UNKNOWN")
+    outgoing = chosen_ev.get("outgoing_refs", []) or []
+    incoming = chosen_ev.get("incoming_refs", []) or []
+    l3_parts = [
+        f"L3 assigned the sheet graph role **`{role}`**."
+    ]
+    if outgoing:
+        l3_parts.append(
+            f"It has outgoing references to `{', '.join(outgoing)}`, which supports a computed/output role."
+        )
+    else:
+        l3_parts.append(
+            "It has no outgoing references recorded in the final evidence."
+        )
+    if incoming:
+        l3_parts.append(
+            f"It also has incoming references from `{', '.join(incoming)}`."
+        )
+    else:
+        l3_parts.append(
+            "It has no incoming references recorded in the final evidence."
+        )
+    if chosen_ev.get("consolidate", False):
+        l3_parts.append(
+            "L3 also marked it as a consolidation-related sheet."
+        )
+    if chosen_ev.get("attention_boost", False):
+        l3_parts.append(
+            "The sheet also received an attention boost from the graph layer."
+        )
+
+    lines += ["### L3 — Context graph", " ".join(l3_parts), ""]
+
+    if chosen_ev.get("gate_passed"):
+        l4_text = (
+            "L4 allowed the sheet to continue because no final blocking gate fired "
+            "for the chosen result in the final state."
+        )
+    else:
+        l4_text = (
+            f"L4 blocked the sheet with **`{chosen_ev.get('blocked_by')}`**. "
+            "If the sheet still survived in the final answer, that would only be because "
+            "a later interpretation reclassified the issue as technical rather than critical."
+        )
+
+    lines += ["### L4 — Hard gates", l4_text, ""]
+
+    conf = chosen_ev.get("confidence")
+    technical_main = final_parsed.get("technical_main_sheet")
+    if conf is not None:
+        l5_text = (
+            f"L5 assigned technical confidence **`{conf:.3f}`**. "
+            f"The technical winner after softmax was **`{technical_main}`**."
+        )
+    else:
+        l5_text = (
+            f"L5 produced the technical winner **`{technical_main}`**, but no final confidence value was available in the extracted evidence."
+        )
+
+    lines += ["### L5 — Technical confidence / softmax", l5_text, ""]
+
+    ba = final_parsed.get("business_arbitration", {}) or {}
+    override_applied = ba.get("override_applied", False)
+    technical_type = ba.get("technical_winner_sheet_type")
+    business_candidate = ba.get("business_candidate")
+    business_type = ba.get("business_candidate_sheet_type")
+    decision_mode = final_parsed.get("decision_mode", "unknown")
+
+    if override_applied:
+        l6_text = (
+            f"L6 overrode the technical winner because the technical sheet was classified as "
+            f"**`{technical_type}`**, while **`{business_candidate}`** was classified as "
+            f"**`{business_type}`** and judged to be the business-correct final output. "
+            f"The final decision mode was **`{decision_mode}`**."
+        )
+    else:
+        l6_text = (
+            f"L6 did not override the technical result. The final decision mode was **`{decision_mode}`**, "
+            f"so the system concluded that the technical winner was also the correct business answer "
+            f"or that no safe reporting-sheet override existed."
+        )
+
+    lines += ["### L6 — Business arbitration", l6_text, ""]
+
+    return lines
+
+
+def _process_explanation_block(state, final_parsed: dict) -> list[str]:
+    sessions = ensure_debug_trace(state).get("court_sessions", [])
+    steps = ensure_debug_trace(state).get("steps", [])
+    decision_mode = final_parsed.get("decision_mode", "unknown")
+    chosen = state.get("main_sheet_name")
+    technical_main = final_parsed.get("technical_main_sheet")
+    business_main = final_parsed.get("business_main_sheet")
+
+    lines = [
+        "## Process explanation",
+        "",
+        "This explanation is written **after the entire pipeline finished**, not during execution.",
+        "It summarizes how the system moved from workbook inspection to a final verified answer.",
+        "",
+        "### End-to-end process",
+        "1. The workbook was inspected and a detector candidate was collected as a non-binding hint.",
+        "2. The plan node translated the initial evidence into targeted checks for the research agent.",
+        "3. The research agent used workbook tools to produce NN-layer evidence.",
+        "4. The court stage reviewed the agent output and either approved it or forced revision.",
+        "5. The synthesis node aggregated the evidence into a final technical decision.",
+        "6. Python guardrails verified that critical blocks were respected.",
+        "7. Layer-6 business arbitration checked whether the technical winner was also the business-correct final output.",
+        "8. Only after all of that completed was this markdown report written.",
+        "",
+        "### Final process outcome",
+        f"- Final main sheet: `{chosen}`",
+        f"- Technical main sheet: `{technical_main}`",
+        f"- Business main sheet: `{business_main}`",
+        f"- Decision mode: `{decision_mode}`",
+        f"- Total logged pipeline steps: `{len(steps)}`",
+        f"- Total court sessions: `{len(sessions)}`",
+        "",
+    ]
+    return lines
+
+
 def _build_decision_markdown(state) -> str:
     result         = state.get("main_sheet_result", {})
     chosen         = state.get("main_sheet_name")
@@ -206,7 +446,6 @@ def _build_decision_markdown(state) -> str:
     detector_cand  = state.get("detector_candidate")
     active_sheet   = result.get("active_sheet")
 
-    # Parse final answer for L6 fields
     final_answer_raw = state.get("final_answer", "")
     final_parsed     = _parse_json_from_text(final_answer_raw) or {}
     technical_main   = final_parsed.get("technical_main_sheet")
@@ -215,11 +454,10 @@ def _build_decision_markdown(state) -> str:
     ba_block         = final_parsed.get("business_arbitration", {})
     main_source_nm   = final_parsed.get("main_source_sheet") if isinstance(final_parsed, dict) else None
 
-    out_cands  = result.get("output_candidates", [])
-    src_cands  = result.get("source_candidates", [])
+    out_cands    = result.get("output_candidates", [])
+    src_cands    = result.get("source_candidates", [])
     agent_result = (state.get("task_results") or [{}])[0].get("result", "")
 
-    # Pull NN evidence for the chosen sheet
     chosen_ev = _extract_nn_evidence(state, chosen)
 
     lines = [
@@ -237,7 +475,6 @@ def _build_decision_markdown(state) -> str:
         "",
     ]
 
-    # Decision mode banner
     if decision_mode == "business_override":
         lines += [
             "🔄 **Business Override Active**: Layer-6 arbitration detected a mismatch "
@@ -252,7 +489,6 @@ def _build_decision_markdown(state) -> str:
             "",
         ]
 
-    # Detector override notice
     if detector_cand and detector_cand != chosen:
         lines += [
             "⚠️ **Detector override**: the heuristic detector suggested "
@@ -261,7 +497,8 @@ def _build_decision_markdown(state) -> str:
             "",
         ]
 
-    # Court sessions
+    lines += _process_explanation_block(state, final_parsed)
+
     sessions = ensure_debug_trace(state).get("court_sessions", [])
     if sessions:
         lines += ["## Court Sessions", ""]
@@ -272,7 +509,6 @@ def _build_decision_markdown(state) -> str:
             )
         lines.append("")
 
-    # Why this sheet — NN evidence block
     lines += ["## Why this sheet was chosen", ""]
     if chosen:
         lines.append(
@@ -292,12 +528,12 @@ def _build_decision_markdown(state) -> str:
             )
     lines.append("")
 
-    # Layer 6 business arbitration block
+    lines += _layer_explanation_block(chosen, chosen_ev, final_parsed)
+
     lines += ["## Layer-6 Business Arbitration", ""]
     lines += _format_business_arbitration_block(ba_block)
     lines.append("")
 
-    # Authority chain
     lines += [
         "## Decision authority chain", "",
         "```",
@@ -320,25 +556,20 @@ def _build_decision_markdown(state) -> str:
         "",
     ]
 
-    # Research agent NN output
     if agent_result:
         lines += [
             "## Research agent NN output", "",
             "```json", str(agent_result), "```", "",
         ]
 
-    # Candidate rankings (heuristic scores kept for reference)
     lines += ["## Candidate rankings (heuristic — for reference only)", ""]
     lines.append(_format_candidate_block(out_cands, "Top output candidates"))
     lines.append(_format_candidate_block(src_cands, "Top source candidates"))
 
-    # Final synthesis JSON
     if state.get("final_answer"):
         lines += ["## Final synthesis JSON", "", "```json", str(state["final_answer"]), "```", ""]
 
     return "\n".join(lines).strip() + "\n"
-
-
 
 
 def export_artifacts(state) -> tuple[str, str]:
