@@ -1,0 +1,21 @@
+>curl -X POST "http://127.0.0.1:8000/run" -F "file=@multi_agent\data\Assembly - 5.xlsx"{
+    "mode": "single_file",
+    "input_file": "Assembly - 5.xlsx",
+    "main_sheet_exists": true,
+    "main_sheet_name": "External Reporting Scheme",
+    "is_card_sheet": "Trial balance",
+    "technical_main_sheet": "External Reporting Scheme",
+    "presentation_main_sheet": "External Reporting Scheme",
+    "technical_tb_sheet": "Trial balance",
+    "decision_mode": "technical_default_after_l6_court",
+    "relationship": {
+        "main_to_tb_path": [
+            "External Reporting Scheme",
+            "BS",
+            "Trial balance"
+        ],
+        "path_valid": true
+    },
+    "json_export_file": "debug_traces\\21e46f4e-348d-4a08-b355-d76938815411.json",
+    "md_export_file": "debug_traces\\21e46f4e-348d-4a08-b355-d76938815411.md"
+}

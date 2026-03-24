@@ -184,6 +184,224 @@ def _norm_text(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _coerce_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _signal_from(payload: dict, *names: str, default: int = 0) -> int:
+    for name in names:
+        if name in payload:
+            return _coerce_int01(payload.get(name))
+    return default
+
+
+def _bool_from(payload: dict, *names: str, default: bool = False) -> bool:
+    for name in names:
+        if name in payload:
+            return _coerce_bool(payload.get(name), default)
+    return default
+
+
+def _first_present(payload: dict, *names: str, default=None):
+    for name in names:
+        if name in payload:
+            return payload.get(name)
+    return default
+
+def _workbook_sheet_name_set(state) -> set[str]:
+    """
+    Canonical set of real workbook sheet names discovered from inspect_workbook().
+    This is the only valid sheet-name universe for all downstream decisions.
+    """
+    names: set[str] = set()
+
+    excel_summary = state.get("excel_summary", {}) or {}
+    for p in excel_summary.get("profiles", []) or []:
+        sn = p.get("sheet_name")
+        if sn:
+            names.add(str(sn).strip())
+
+    # defensive fallback in case summary shape changes
+    main_sheet_result = state.get("main_sheet_result", {}) or {}
+    for bucket in ("profiles", "output_candidates", "source_candidates"):
+        for item in main_sheet_result.get(bucket, []) or []:
+            sn = item.get("sheet_name") or item.get("sheet")
+            if sn:
+                names.add(str(sn).strip())
+
+    return {n for n in names if n}
+
+
+def _is_real_sheet_name(state, value: Any) -> bool:
+    name = _clean_sheet_name(value)
+    if not name:
+        return False
+    return name in _workbook_sheet_name_set(state)
+
+
+def _sanitize_sheet_name(state, value: Any) -> str | None:
+    """
+    Keep the sheet name only if it exactly matches a real workbook tab.
+    Otherwise return None.
+    """
+    name = _clean_sheet_name(value)
+    if not name:
+        return None
+    return name if _is_real_sheet_name(state, name) else None
+
+
+def _sanitize_sheet_name_list(state, values: Any) -> list[str]:
+    """
+    Keep only real workbook sheet names, preserving order and uniqueness.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    if not isinstance(values, list):
+        return out
+
+    for v in values:
+        name = _sanitize_sheet_name(state, v)
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+
+    return out
+
+
+def _sanitize_research_agent_payload(parsed: dict, state) -> tuple[dict, list[str]]:
+    """
+    Remove any sheet references that are not real workbook tabs.
+    This prevents hallucinated semantic aliases from becoming explicit evidence.
+    """
+    fixed = dict(parsed)
+    removed: list[str] = []
+
+    single_sheet_fields = (
+        "main_sheet_name",
+        "main_source_sheet_name",
+        "technical_main_sheet",
+        "presentation_main_sheet",
+        "business_main_sheet",
+        "technical_tb_sheet",
+        "is_card_sheet",
+        "runner_up",
+        "strongest_candidate",
+        "verification_target",
+        "fallback_candidate",
+        "intermediate_sheet_name",
+    )
+
+    for field in single_sheet_fields:
+        if field in fixed:
+            original = fixed.get(field)
+            cleaned = _sanitize_sheet_name(state, original)
+            if original and cleaned is None:
+                removed.append(f"{field}:{original}")
+            fixed[field] = cleaned
+
+    relationship = fixed.get("relationship", {}) or {}
+    if isinstance(relationship, dict):
+        original_path = relationship.get("main_to_tb_path", []) or []
+        cleaned_path = _sanitize_sheet_name_list(state, original_path)
+
+        if list(original_path) != cleaned_path:
+            removed.append(f"relationship.main_to_tb_path:{original_path}")
+
+        relationship["main_to_tb_path"] = cleaned_path
+
+        # if path got shortened/changed, do not trust prior validity bit
+        if cleaned_path != list(original_path):
+            relationship["path_valid"] = False
+
+        fixed["relationship"] = relationship
+
+    sheet_evidence = fixed.get("sheet_evidence", {}) or {}
+    if isinstance(sheet_evidence, dict):
+        cleaned_sheet_evidence = {}
+        for sheet_name, payload in sheet_evidence.items():
+            clean_name = _sanitize_sheet_name(state, sheet_name)
+            if clean_name is None:
+                removed.append(f"sheet_evidence:{sheet_name}")
+                continue
+
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                l3 = payload.get("layer3", {}) or {}
+                if isinstance(l3, dict):
+                    orig_out = l3.get("outgoing_refs", []) or []
+                    orig_in = l3.get("incoming_refs", []) or []
+                    orig_path = l3.get("path_to_tb", []) or []
+
+                    clean_out = _sanitize_sheet_name_list(state, orig_out)
+                    clean_in = _sanitize_sheet_name_list(state, orig_in)
+                    clean_path = _sanitize_sheet_name_list(state, orig_path)
+
+                    if clean_out != list(orig_out):
+                        removed.append(f"{sheet_name}.layer3.outgoing_refs:{orig_out}")
+                    if clean_in != list(orig_in):
+                        removed.append(f"{sheet_name}.layer3.incoming_refs:{orig_in}")
+                    if clean_path != list(orig_path):
+                        removed.append(f"{sheet_name}.layer3.path_to_tb:{orig_path}")
+                        l3["path_valid"] = False
+
+                    l3["outgoing_refs"] = clean_out
+                    l3["incoming_refs"] = clean_in
+                    l3["path_to_tb"] = clean_path
+                    payload["layer3"] = l3
+
+            cleaned_sheet_evidence[clean_name] = payload
+
+        fixed["sheet_evidence"] = cleaned_sheet_evidence
+
+    hidden_sheets = fixed.get("hidden_sheets")
+    if isinstance(hidden_sheets, list):
+        cleaned = _sanitize_sheet_name_list(state, hidden_sheets)
+        if cleaned != hidden_sheets:
+            removed.append(f"hidden_sheets:{hidden_sheets}")
+        fixed["hidden_sheets"] = cleaned
+
+    tb_sheets = fixed.get("tb_sheets")
+    if isinstance(tb_sheets, list):
+        cleaned = _sanitize_sheet_name_list(state, tb_sheets)
+        if cleaned != tb_sheets:
+            removed.append(f"tb_sheets:{tb_sheets}")
+        fixed["tb_sheets"] = cleaned
+
+    nn_evidence = fixed.get("nn_evidence", {}) or {}
+    if (
+        isinstance(nn_evidence, dict)
+        and ("layer1" in nn_evidence or "layer2" in nn_evidence or "layer3" in nn_evidence or "layer4" in nn_evidence)
+    ):
+        l3 = nn_evidence.get("layer3", {}) or {}
+        if isinstance(l3, dict):
+            orig_out = l3.get("outgoing_refs", []) or []
+            orig_in = l3.get("incoming_refs", []) or []
+            orig_path = l3.get("path_to_tb", []) or []
+
+            clean_out = _sanitize_sheet_name_list(state, orig_out)
+            clean_in = _sanitize_sheet_name_list(state, orig_in)
+            clean_path = _sanitize_sheet_name_list(state, orig_path)
+
+            if clean_out != list(orig_out):
+                removed.append(f"nn_evidence.layer3.outgoing_refs:{orig_out}")
+            if clean_in != list(orig_in):
+                removed.append(f"nn_evidence.layer3.incoming_refs:{orig_in}")
+            if clean_path != list(orig_path):
+                removed.append(f"nn_evidence.layer3.path_to_tb:{orig_path}")
+                l3["path_valid"] = False
+
+            l3["outgoing_refs"] = clean_out
+            l3["incoming_refs"] = clean_in
+            l3["path_to_tb"] = clean_path
+            nn_evidence["layer3"] = l3
+            fixed["nn_evidence"] = nn_evidence
+
+    return fixed, removed
 # ─────────────────────────────────────────────────────────────────────────────
 #  Evidence indexing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,7 +449,14 @@ def _extract_candidate_sheet_names_from_state(state) -> list[str]:
             if sheet:
                 names.add(str(sheet).strip())
 
-    for field in ("detector_candidate", "main_sheet_name"):
+    for field in (
+        "detector_candidate",
+        "main_sheet_name",
+        "technical_main_sheet",
+        "presentation_main_sheet",
+        "technical_tb_sheet",
+        "is_card_sheet",
+    ):
         val = state.get(field)
         if val:
             names.add(str(val).strip())
@@ -240,18 +465,26 @@ def _extract_candidate_sheet_names_from_state(state) -> list[str]:
         parsed = _parse_json_from_text(task.get("result", ""))
         if not parsed:
             continue
+
         for field in (
             "main_sheet_name",
             "main_source_sheet_name",
             "technical_main_sheet",
+            "presentation_main_sheet",
             "business_main_sheet",
+            "technical_tb_sheet",
+            "is_card_sheet",
             "runner_up",
         ):
             val = parsed.get(field)
             if val:
                 names.add(str(val).strip())
 
-        # also collect names from structured evidence maps
+        relationship = parsed.get("relationship", {}) or {}
+        for sheet in relationship.get("main_to_tb_path", []) or []:
+            if sheet:
+                names.add(str(sheet).strip())
+
         sheet_evidence = parsed.get("sheet_evidence", {}) or {}
         if isinstance(sheet_evidence, dict):
             for sheet in sheet_evidence.keys():
@@ -268,7 +501,8 @@ def _extract_candidate_sheet_names_from_state(state) -> list[str]:
                 ):
                     names.add(str(sheet).strip())
 
-    return sorted(n for n in names if n)
+    real_names = _workbook_sheet_name_set(state)
+    return sorted(n for n in names if n and n in real_names)
 
 
 def _derive_sheet_evidence_from_single_task(parsed: dict, state) -> dict[str, dict]:
@@ -284,26 +518,51 @@ def _derive_sheet_evidence_from_single_task(parsed: dict, state) -> dict[str, di
             "sheet_name": sheet_name,
             "evidence_status": "explicit",
             "source_task_type": "research_agent",
-            "COMPANY_COLUMN_SIGNAL": _coerce_int01(l1.get("COMPANY_COLUMN_SIGNAL", 0)),
-            "HIDDEN_SIGNAL": _coerce_int01(l1.get("HIDDEN_SIGNAL", 0)),
-            "COA_SIGNAL": _coerce_int01(l1.get("COA_SIGNAL", 0)),
-            "CONSOLIDATE_SIGNAL": _coerce_int01(l1.get("CONSOLIDATE_SIGNAL", 0)),
-            "CROSS_REF_SIGNAL": _coerce_int01(l1.get("CROSS_REF_SIGNAL", 0)),
-            "AJE_SIGNAL": _coerce_int01(l1.get("AJE_SIGNAL", 0)),
-            "FORMULA_SIGNAL": _coerce_int01(l1.get("FORMULA_SIGNAL", 0)),
-            "CODE_COLUMN_SIGNAL": _coerce_int01(l1.get("CODE_COLUMN_SIGNAL", 0)),
-            "FINAL_COLUMN_SIGNAL": _coerce_int01(l1.get("FINAL_COLUMN_SIGNAL", 0)),
-            "FS_PATTERN": _coerce_int01(l2.get("FS_PATTERN", 0)),
-            "TB_PATTERN": _coerce_int01(l2.get("TB_PATTERN", 0)),
-            "PARTIAL_FS_PATTERN": _coerce_int01(l2.get("PARTIAL_FS_PATTERN", 0)),
-            "role_in_graph": l3.get("role_in_graph", "UNKNOWN") or "UNKNOWN",
-            "outgoing_refs": list(l3.get("outgoing_refs", []) or []),
-            "incoming_refs": list(l3.get("incoming_refs", []) or []),
-            "consolidate": _coerce_bool(l3.get("consolidate", False)),
-            "attention_boost": _coerce_bool(l3.get("attention_boost", False)),
-            "gate_passed": _coerce_bool(l4.get("passed", True)),
+
+            # L1 — backward + forward compatible
+            "COMPANY_COLUMN_SIGNAL": _signal_from(l1, "COMPANY_COLUMN_SIGNAL"),
+            "HIDDEN_SIGNAL": _signal_from(l1, "HIDDEN_SIGNAL"),
+            "COA_SIGNAL": _signal_from(l1, "COA_SIGNAL"),
+            "CONSOLIDATE_SIGNAL": _signal_from(l1, "CONSOLIDATE_SIGNAL"),
+            "CROSS_REF_SIGNAL": _signal_from(l1, "CROSS_REF_SIGNAL"),
+            "AJE_SIGNAL": _signal_from(l1, "AJE_SIGNAL"),
+            "FORMULA_SIGNAL": _signal_from(l1, "FORMULA_SIGNAL"),
+
+            # old names
+            "CODE_COLUMN_SIGNAL": _signal_from(l1, "CODE_COLUMN_SIGNAL", "HAS_CODE_COLUMN"),
+            "FINAL_COLUMN_SIGNAL": _signal_from(l1, "FINAL_COLUMN_SIGNAL", "HAS_FINAL_COLUMN"),
+
+            # new names
+            "HAS_CODE_COLUMN": _signal_from(l1, "HAS_CODE_COLUMN", "CODE_COLUMN_SIGNAL"),
+            "HAS_DESCRIPTION_COLUMN": _signal_from(l1, "HAS_DESCRIPTION_COLUMN"),
+            "HAS_FINAL_COLUMN": _signal_from(l1, "HAS_FINAL_COLUMN", "FINAL_COLUMN_SIGNAL"),
+            "FINAL_REFERENCE_SIGNAL": _signal_from(l1, "FINAL_REFERENCE_SIGNAL"),
+            "TB_REFERENCE_SIGNAL": _signal_from(l1, "TB_REFERENCE_SIGNAL"),
+            "STAGING_ROLE_SIGNAL": _signal_from(l1, "STAGING_ROLE_SIGNAL"),
+
+            # L2
+            "FS_PATTERN": _signal_from(l2, "FS_PATTERN"),
+            "TB_PATTERN": _signal_from(l2, "TB_PATTERN"),
+            "PARTIAL_FS_PATTERN": _signal_from(l2, "PARTIAL_FS_PATTERN"),
+            "STRONG_TB_PATTERN": _signal_from(l2, "STRONG_TB_PATTERN"),
+            "STAGING_PATTERN": _signal_from(l2, "STAGING_PATTERN"),
+
+            # L3
+            "role_in_graph": _first_present(l3, "role_in_graph", default="UNKNOWN") or "UNKNOWN",
+            "outgoing_refs": list(_coerce_list(l3.get("outgoing_refs"))),
+            "incoming_refs": list(_coerce_list(l3.get("incoming_refs"))),
+            "consolidate": _bool_from(l3, "consolidate"),
+            "attention_boost": _bool_from(l3, "attention_boost"),
+            "aje_source_role": _bool_from(l3, "aje_source_role"),
+            "path_to_tb": list(_coerce_list(l3.get("path_to_tb"))),
+            "path_valid": _bool_from(l3, "path_valid"),
+
+            # L4 / L5
+            "gate_passed": _bool_from(l4, "passed", default=True),
             "blocked_by": l4.get("blocked_by"),
             "confidence": float(payload.get("layer5_confidence", 0.0) or 0.0),
+
+            # misc
             "main_sheet_confirmed": False,
             "is_main_source_hint": False,
             "title": _sheet_title_from_candidates(state, sheet_name),
@@ -313,8 +572,9 @@ def _derive_sheet_evidence_from_single_task(parsed: dict, state) -> dict[str, di
     if isinstance(canonical_sheet_evidence, dict):
         for sheet_name, payload in canonical_sheet_evidence.items():
             if isinstance(payload, dict):
-                clean_name = str(sheet_name).strip()
-                evidence_map[clean_name] = _make_sheet_record(clean_name, payload)
+                clean_name = _sanitize_sheet_name(state, sheet_name)
+                if clean_name:
+                    evidence_map[clean_name] = _make_sheet_record(clean_name, payload)
 
     legacy_evidence = parsed.get("evidence", {}) or {}
     if isinstance(legacy_evidence, dict):
@@ -322,29 +582,27 @@ def _derive_sheet_evidence_from_single_task(parsed: dict, state) -> dict[str, di
         if isinstance(nested_sheet_evidence, dict):
             for sheet_name, payload in nested_sheet_evidence.items():
                 if isinstance(payload, dict):
-                    clean_name = str(sheet_name).strip()
-                    evidence_map[clean_name] = _make_sheet_record(clean_name, payload)
+                    clean_name = _sanitize_sheet_name(state, sheet_name)
+                    if clean_name:
+                        evidence_map[clean_name] = _make_sheet_record(clean_name, payload)
 
         for sheet_name, payload in legacy_evidence.items():
             if not isinstance(payload, dict):
                 continue
             if sheet_name in {"ocr_used", "company_columns", "sections_found", "sheet_evidence"}:
                 continue
-            if (
-                "layer1" in payload
-                or "layer2" in payload
-                or "layer3" in payload
-                or "layer4" in payload
-            ):
-                clean_name = str(sheet_name).strip()
-                evidence_map[clean_name] = _make_sheet_record(clean_name, payload)
+            if any(k in payload for k in ("layer1", "layer2", "layer3", "layer4")):
+                clean_name = _sanitize_sheet_name(state, sheet_name)
+                if clean_name:
+                    evidence_map[clean_name] = _make_sheet_record(clean_name, payload)
 
-    main_sheet = _clean_sheet_name(parsed.get("main_sheet_name"))
+    main_sheet = _sanitize_sheet_name(state, parsed.get("main_sheet_name"))
     nn = parsed.get("nn_evidence", {}) or {}
     if main_sheet and nn and main_sheet not in evidence_map:
         evidence_map[main_sheet] = _make_sheet_record(main_sheet, nn)
 
-    main_source = _clean_sheet_name(parsed.get("main_source_sheet_name"))
+    # old source hint compatibility
+    main_source = _sanitize_sheet_name(state, parsed.get("main_source_sheet_name"))
     if main_source and main_source not in evidence_map:
         evidence_map[main_source] = {
             "sheet_name": main_source,
@@ -359,14 +617,25 @@ def _derive_sheet_evidence_from_single_task(parsed: dict, state) -> dict[str, di
             "FORMULA_SIGNAL": 0,
             "CODE_COLUMN_SIGNAL": 0,
             "FINAL_COLUMN_SIGNAL": 0,
+            "HAS_CODE_COLUMN": 0,
+            "HAS_DESCRIPTION_COLUMN": 0,
+            "HAS_FINAL_COLUMN": 0,
+            "FINAL_REFERENCE_SIGNAL": 0,
+            "TB_REFERENCE_SIGNAL": 0,
+            "STAGING_ROLE_SIGNAL": 0,
             "FS_PATTERN": 0,
             "TB_PATTERN": 0,
             "PARTIAL_FS_PATTERN": 0,
+            "STRONG_TB_PATTERN": 0,
+            "STAGING_PATTERN": 0,
             "role_in_graph": "UNKNOWN",
             "outgoing_refs": [],
             "incoming_refs": [],
             "consolidate": False,
             "attention_boost": False,
+            "aje_source_role": False,
+            "path_to_tb": [],
+            "path_valid": False,
             "gate_passed": False,
             "blocked_by": "UNVALIDATED_REFERENCED_ONLY",
             "confidence": 0.0,
@@ -511,7 +780,7 @@ def _normalize_research_agent_result(parsed: dict) -> dict:
 
     return fixed
 
-def _candidate_names_from_parsed_result(parsed: dict) -> set[str]:
+def _candidate_names_from_parsed_result(parsed: dict,state) -> set[str]:
     names: set[str] = set()
     if not parsed:
         return names
@@ -552,7 +821,8 @@ def _candidate_names_from_parsed_result(parsed: dict) -> set[str]:
             ):
                 names.add(str(sheet).strip())
 
-    return {n for n in names if n}
+    real_names = _workbook_sheet_name_set(state)
+    return {n for n in names if n and n in real_names}
 
 
 def _apply_sheet_payload(row: dict, payload: dict, state) -> None:
@@ -566,62 +836,46 @@ def _apply_sheet_payload(row: dict, payload: dict, state) -> None:
     if "research_agent" not in row["source_task_types"]:
         row["source_task_types"].append("research_agent")
 
-    row["COMPANY_COLUMN_SIGNAL"] = _coerce_int01(
-        l1.get("COMPANY_COLUMN_SIGNAL", row["COMPANY_COLUMN_SIGNAL"])
-    )
-    row["HIDDEN_SIGNAL"] = _coerce_int01(
-        l1.get("HIDDEN_SIGNAL", row["HIDDEN_SIGNAL"])
-    )
-    row["COA_SIGNAL"] = _coerce_int01(
-        l1.get("COA_SIGNAL", row["COA_SIGNAL"])
-    )
-    row["CONSOLIDATE_SIGNAL"] = _coerce_int01(
-        l1.get("CONSOLIDATE_SIGNAL", row["CONSOLIDATE_SIGNAL"])
-    )
-    row["CROSS_REF_SIGNAL"] = _coerce_int01(
-        l1.get("CROSS_REF_SIGNAL", row["CROSS_REF_SIGNAL"])
-    )
-    row["AJE_SIGNAL"] = _coerce_int01(
-        l1.get("AJE_SIGNAL", row["AJE_SIGNAL"])
-    )
-    row["FORMULA_SIGNAL"] = _coerce_int01(
-        l1.get("FORMULA_SIGNAL", row["FORMULA_SIGNAL"])
-    )
-    row["CODE_COLUMN_SIGNAL"] = _coerce_int01(
-        l1.get("CODE_COLUMN_SIGNAL", row["CODE_COLUMN_SIGNAL"])
-    )
-    row["FINAL_COLUMN_SIGNAL"] = _coerce_int01(
-        l1.get("FINAL_COLUMN_SIGNAL", row["FINAL_COLUMN_SIGNAL"])
-    )
+    # L1
+    row["COMPANY_COLUMN_SIGNAL"] = _signal_from(l1, "COMPANY_COLUMN_SIGNAL", default=row["COMPANY_COLUMN_SIGNAL"])
+    row["HIDDEN_SIGNAL"] = _signal_from(l1, "HIDDEN_SIGNAL", default=row["HIDDEN_SIGNAL"])
+    row["COA_SIGNAL"] = _signal_from(l1, "COA_SIGNAL", default=row["COA_SIGNAL"])
+    row["CONSOLIDATE_SIGNAL"] = _signal_from(l1, "CONSOLIDATE_SIGNAL", default=row["CONSOLIDATE_SIGNAL"])
+    row["CROSS_REF_SIGNAL"] = _signal_from(l1, "CROSS_REF_SIGNAL", default=row["CROSS_REF_SIGNAL"])
+    row["AJE_SIGNAL"] = _signal_from(l1, "AJE_SIGNAL", default=row["AJE_SIGNAL"])
+    row["FORMULA_SIGNAL"] = _signal_from(l1, "FORMULA_SIGNAL", default=row["FORMULA_SIGNAL"])
 
-    row["FS_PATTERN"] = _coerce_int01(
-        l2.get("FS_PATTERN", row["FS_PATTERN"])
-    )
-    row["TB_PATTERN"] = _coerce_int01(
-        l2.get("TB_PATTERN", row["TB_PATTERN"])
-    )
-    row["PARTIAL_FS_PATTERN"] = _coerce_int01(
-        l2.get("PARTIAL_FS_PATTERN", row["PARTIAL_FS_PATTERN"])
-    )
+    row["CODE_COLUMN_SIGNAL"] = _signal_from(l1, "CODE_COLUMN_SIGNAL", "HAS_CODE_COLUMN", default=row["CODE_COLUMN_SIGNAL"])
+    row["FINAL_COLUMN_SIGNAL"] = _signal_from(l1, "FINAL_COLUMN_SIGNAL", "HAS_FINAL_COLUMN", default=row["FINAL_COLUMN_SIGNAL"])
 
-    row["role_in_graph"] = l3.get("role_in_graph", row["role_in_graph"]) or row["role_in_graph"]
-    row["outgoing_refs"] = list(l3.get("outgoing_refs", row["outgoing_refs"]) or [])
-    row["incoming_refs"] = list(l3.get("incoming_refs", row["incoming_refs"]) or [])
-    row["consolidate"] = _coerce_bool(
-        l3.get("consolidate", row["consolidate"])
-    )
-    row["attention_boost"] = _coerce_bool(
-        l3.get("attention_boost", row["attention_boost"])
-    )
+    row["HAS_CODE_COLUMN"] = _signal_from(l1, "HAS_CODE_COLUMN", "CODE_COLUMN_SIGNAL", default=row["HAS_CODE_COLUMN"])
+    row["HAS_DESCRIPTION_COLUMN"] = _signal_from(l1, "HAS_DESCRIPTION_COLUMN", default=row["HAS_DESCRIPTION_COLUMN"])
+    row["HAS_FINAL_COLUMN"] = _signal_from(l1, "HAS_FINAL_COLUMN", "FINAL_COLUMN_SIGNAL", default=row["HAS_FINAL_COLUMN"])
+    row["FINAL_REFERENCE_SIGNAL"] = _signal_from(l1, "FINAL_REFERENCE_SIGNAL", default=row["FINAL_REFERENCE_SIGNAL"])
+    row["TB_REFERENCE_SIGNAL"] = _signal_from(l1, "TB_REFERENCE_SIGNAL", default=row["TB_REFERENCE_SIGNAL"])
+    row["STAGING_ROLE_SIGNAL"] = _signal_from(l1, "STAGING_ROLE_SIGNAL", default=row["STAGING_ROLE_SIGNAL"])
 
-    row["gate_passed"] = _coerce_bool(
-        l4.get("passed", row["gate_passed"])
-    )
-    row["blocked_by"] = l4.get("blocked_by", row["blocked_by"])
+    # L2
+    row["FS_PATTERN"] = _signal_from(l2, "FS_PATTERN", default=row["FS_PATTERN"])
+    row["TB_PATTERN"] = _signal_from(l2, "TB_PATTERN", default=row["TB_PATTERN"])
+    row["PARTIAL_FS_PATTERN"] = _signal_from(l2, "PARTIAL_FS_PATTERN", default=row["PARTIAL_FS_PATTERN"])
+    row["STRONG_TB_PATTERN"] = _signal_from(l2, "STRONG_TB_PATTERN", default=row["STRONG_TB_PATTERN"])
+    row["STAGING_PATTERN"] = _signal_from(l2, "STAGING_PATTERN", default=row["STAGING_PATTERN"])
 
-    row["confidence"] = float(
-        payload.get("layer5_confidence", row["confidence"]) or 0.0
-    )
+    # L3
+    row["role_in_graph"] = _first_present(l3, "role_in_graph", default=row["role_in_graph"]) or row["role_in_graph"]
+    row["outgoing_refs"] = list(_coerce_list(_first_present(l3, "outgoing_refs", default=row["outgoing_refs"])))
+    row["incoming_refs"] = list(_coerce_list(_first_present(l3, "incoming_refs", default=row["incoming_refs"])))
+    row["consolidate"] = _bool_from(l3, "consolidate", default=row["consolidate"])
+    row["attention_boost"] = _bool_from(l3, "attention_boost", default=row["attention_boost"])
+    row["aje_source_role"] = _bool_from(l3, "aje_source_role", default=row["aje_source_role"])
+    row["path_to_tb"] = list(_coerce_list(_first_present(l3, "path_to_tb", default=row["path_to_tb"])))
+    row["path_valid"] = _bool_from(l3, "path_valid", default=row["path_valid"])
+
+    # L4/L5
+    row["gate_passed"] = _bool_from(l4, "passed", default=row["gate_passed"])
+    row["blocked_by"] = _first_present(l4, "blocked_by", default=row["blocked_by"])
+    row["confidence"] = float(payload.get("layer5_confidence", row["confidence"]) or 0.0)
 
     if not row.get("title"):
         row["title"] = _sheet_title_from_candidates(state, row["sheet_name"])
@@ -658,6 +912,7 @@ def _build_candidate_registry(state) -> dict[str, dict]:
                 "source_task_types": [],
 
                 # L1
+                # L1
                 "COMPANY_COLUMN_SIGNAL": 0,
                 "HIDDEN_SIGNAL": 0,
                 "COA_SIGNAL": 0,
@@ -665,13 +920,23 @@ def _build_candidate_registry(state) -> dict[str, dict]:
                 "CROSS_REF_SIGNAL": 0,
                 "AJE_SIGNAL": 0,
                 "FORMULA_SIGNAL": 0,
+
                 "CODE_COLUMN_SIGNAL": 0,
                 "FINAL_COLUMN_SIGNAL": 0,
+
+                "HAS_CODE_COLUMN": 0,
+                "HAS_DESCRIPTION_COLUMN": 0,
+                "HAS_FINAL_COLUMN": 0,
+                "FINAL_REFERENCE_SIGNAL": 0,
+                "TB_REFERENCE_SIGNAL": 0,
+                "STAGING_ROLE_SIGNAL": 0,
 
                 # L2
                 "FS_PATTERN": 0,
                 "TB_PATTERN": 0,
                 "PARTIAL_FS_PATTERN": 0,
+                "STRONG_TB_PATTERN": 0,
+                "STAGING_PATTERN": 0,
 
                 # L3
                 "role_in_graph": "UNKNOWN",
@@ -679,6 +944,9 @@ def _build_candidate_registry(state) -> dict[str, dict]:
                 "incoming_refs": [],
                 "consolidate": False,
                 "attention_boost": False,
+                "aje_source_role": False,
+                "path_to_tb": [],
+                "path_valid": False,
 
                 # L4/L5
                 "gate_passed": False,
@@ -739,7 +1007,7 @@ def _build_candidate_registry(state) -> dict[str, dict]:
             continue
         parsed_tasks.append(parsed)
 
-        for sheet in _candidate_names_from_parsed_result(parsed):
+        for sheet in _candidate_names_from_parsed_result(parsed,state):
             ensure_row(sheet)
 
         v = _clean_sheet_name(parsed.get("main_sheet_name"))
@@ -877,10 +1145,30 @@ def _restrict_synthesis_to_evidence_backed_candidates(parsed: dict, state) -> di
     """
     Synthesis may only select sheets with explicit evidence.
     Referenced-only or missing-evidence sheets cannot become main sheet.
+    Also forbids nonexistent workbook sheet names.
     """
     fixed = dict(parsed)
     candidate = _clean_sheet_name(fixed.get("main_sheet_name"))
+
     if not candidate:
+        return fixed
+
+    if not _is_real_sheet_name(state, candidate):
+        add_step_log(state, "synthesis:invalid_candidate_rejected", {
+            "candidate": candidate,
+            "reason": "candidate is not a real workbook sheet",
+        })
+        fixed["main_sheet_exists"] = False
+        fixed["main_sheet_name"] = None
+        fixed["confidence"] = 0.0
+        fixed["reasoning"] = (
+            f"Synthesis proposed '{candidate}', but that name does not exist in the workbook. "
+            f"Only real workbook sheet names may become main_sheet_name."
+        )
+        fixed["api_response"] = {
+            "main_sheet_exists": False,
+            "main_sheet_name": None,
+        }
         return fixed
 
     ev = _extract_nn_evidence(state, candidate)
@@ -906,7 +1194,6 @@ def _restrict_synthesis_to_evidence_backed_candidates(parsed: dict, state) -> di
     }
     return fixed
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  NN-aware guardrails
 # ─────────────────────────────────────────────────────────────────────────────
@@ -929,8 +1216,11 @@ def _apply_nn_guardrails(parsed: dict, state) -> dict:
     ev = _extract_nn_evidence(state, sheet_name)
     disqualify_reason: str | None = None
     is_critical_block = False
+    if not _is_real_sheet_name(state, sheet_name):
+        disqualify_reason = f"'{sheet_name}' is not a real workbook sheet."
+        is_critical_block = True
 
-    if not ev or ev.get("evidence_status") != "explicit":
+    elif not ev or ev.get("evidence_status") != "explicit":
         disqualify_reason = (
             f"G0: no explicit NN evidence exists for sheet '{sheet_name}' "
             f"(evidence_status={ev.get('evidence_status', 'missing') if ev else 'missing'})"
@@ -939,32 +1229,36 @@ def _apply_nn_guardrails(parsed: dict, state) -> dict:
 
     elif not ev.get("gate_passed", False):
         blocked_by = ev.get("blocked_by", "unknown gate")
-
         if blocked_by == "GATE_2":
             add_step_log(state, "guardrail:gate2_noted", {
                 "sheet": sheet_name,
-                "reason": (
-                    "GATE_2 (no company columns) — recorded for Layer-6 business "
-                    "arbitration, not treated as fatal at this stage"
-                ),
+                "reason": "GATE_2 kept non-fatal for Layer-6 business arbitration.",
             })
         else:
             disqualify_reason = (
-                f"G4: NN layer4.passed=false (blocked_by={blocked_by}) "
-                f"— critical gate fired, sheet permanently disqualified"
+                f"Critical gate fired for '{sheet_name}' (blocked_by={blocked_by})."
             )
             is_critical_block = True
 
     elif ev.get("HIDDEN_SIGNAL") == 1:
-        disqualify_reason = "G1: HIDDEN_SIGNAL=1 — hidden sheets cannot be main sheet"
+        disqualify_reason = "Hidden sheets cannot be main sheet."
         is_critical_block = True
 
-    elif ev.get("TB_PATTERN") == 1:
-        disqualify_reason = "G3: TB_PATTERN=1 — trial balance / ledger sheets are sources, not main sheets"
+    elif ev.get("TB_PATTERN") == 1 or ev.get("STRONG_TB_PATTERN") == 1:
+        disqualify_reason = "TB/card sheets are sources, not main sheets."
+        is_critical_block = True
+
+    elif ev.get("STAGING_PATTERN") == 1 or ev.get("aje_source_role") is True:
+        disqualify_reason = "Staging/AJE-support sheets cannot be the final main sheet."
         is_critical_block = True
 
     elif confidence < 0.40:
-        disqualify_reason = f"G5: confidence={confidence:.2f} is below 0.40 threshold"
+        disqualify_reason = f"confidence={confidence:.2f} is below 0.40 threshold"
+    
+    elif ev.get("FS_PATTERN") == 1 and ev.get("path_valid", False) is False:
+        disqualify_reason = (
+            f"FS candidate '{sheet_name}' has no valid main-to-TB path."
+        )
 
     if not disqualify_reason:
         return result
@@ -973,66 +1267,19 @@ def _apply_nn_guardrails(parsed: dict, state) -> dict:
         "sheet": sheet_name,
         "reason": disqualify_reason,
         "critical": is_critical_block,
-        "nn_evidence": safe_preview(ev, 800),
+        "nn_evidence": safe_preview(ev, 1000),
     })
 
-    runner_up = _clean_sheet_name(result.get("runner_up"))
-    if runner_up:
-        ru_ev = _extract_nn_evidence(state, runner_up)
-        ru_conf = float(ru_ev.get("confidence", 0.0) or 0.0)
-
-        ru_passes = (
-            ru_ev.get("evidence_status") == "explicit"
-            and ru_ev.get("gate_passed", False)
-            and ru_ev.get("COMPANY_COLUMN_SIGNAL", 0) == 1
-            and ru_ev.get("HIDDEN_SIGNAL", 0) == 0
-            and ru_ev.get("TB_PATTERN", 0) == 0
-            and ru_conf >= 0.40
-        )
-
-        if ru_passes:
-            add_step_log(state, "guardrail:runner_up_promoted", {
-                "blocked": sheet_name,
-                "promoted": runner_up,
-                "ru_confidence": ru_conf,
-            })
-            result.update({
-                "main_sheet_exists": True,
-                "main_sheet_name": runner_up,
-                "confidence": ru_conf,
-                "reasoning": (
-                    f"Sheet '{sheet_name}' was blocked by Python guardrails "
-                    f"({disqualify_reason}). Runner-up '{runner_up}' had explicit "
-                    f"NN evidence and passed all guardrails."
-                ),
-                "api_response": {
-                    "main_sheet_exists": True,
-                    "main_sheet_name": runner_up,
-                },
-            })
-            return result
-
-    add_step_log(state, "guardrail:no_valid_sheet", {
-        "reason": disqualify_reason,
-        "runner_up_attempted": runner_up,
-        "runner_up_passed": False,
-    })
     result.update({
         "main_sheet_exists": False,
         "main_sheet_name": None,
         "confidence": 0.0,
-        "reasoning": (
-            f"No valid main sheet found. '{sheet_name}' was blocked: "
-            f"{disqualify_reason}. Runner-up '{runner_up}' was absent, invalid, "
-            f"or lacked explicit NN evidence."
-        ),
         "api_response": {
             "main_sheet_exists": False,
             "main_sheet_name": None,
         },
     })
     return result
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Layer 6 — Business arbitration helpers
@@ -1043,23 +1290,20 @@ def _classify_sheet_type(sheet_name: str | None, ev: dict, title: str = "") -> s
         return "UNKNOWN"
 
     sig = _business_signals(sheet_name, ev, title)
-    name_l = _norm_text(sheet_name)
 
-    if ev.get("TB_PATTERN") == 1 or ev.get("role_in_graph") == "TB":
+    if ev.get("TB_PATTERN") == 1 or ev.get("STRONG_TB_PATTERN") == 1 or ev.get("role_in_graph") == "TB":
         return "SOURCE_TB"
 
-    if ev.get("FS_PATTERN") == 1:
-        if sig["STAGING_SHEET_SIGNAL"] and any(
-            kw in name_l for kw in ["aje", "adjusting", "adjustments", "elimination"]
-        ):
-            return "ADJUSTMENT_STAGING"
-        return "REPORTING_FS"
-
     if (
-        ev.get("AJE_SIGNAL") == 1
+        ev.get("STAGING_PATTERN") == 1
+        or ev.get("aje_source_role") is True
+        or ev.get("role_in_graph") == "STAGING"
         or sig["STAGING_SHEET_SIGNAL"]
     ):
         return "ADJUSTMENT_STAGING"
+
+    if ev.get("FS_PATTERN") == 1:
+        return "REPORTING_FS"
 
     if sig["FINAL_OUTPUT_ROLE_SIGNAL"]:
         return "REPORTING_FS"
@@ -1083,7 +1327,7 @@ def _disqualification_class(ev: dict, sheet_type: str) -> str:
     if passed and not blocked_by:
         return "NONE"
 
-    if blocked_by in ("GATE_1", "GATE_3", "GATE_4"):
+    if blocked_by in ("GATE_1", "GATE_3", "GATE_4", "GATE_5"):
         return "CRITICAL"
 
     if blocked_by == "GATE_2" and sheet_type == "REPORTING_FS":
@@ -1119,6 +1363,7 @@ def _presentation_rank(sheet: str, ev: dict, title: str) -> tuple:
 
     explicit = 1 if ev.get("evidence_status") == "explicit" else 0
     non_critical = 1 if dq in ("NONE", "TECHNICAL") else 0
+    valid_path = 1 if ev.get("path_valid", False) else 0
     final_output = 1 if sig["FINAL_OUTPUT_ROLE_SIGNAL"] else 0
     canonical_title = 1 if sig["CANONICAL_FS_TITLE_SIGNAL"] else 0
     presentation_layout = 1 if sig["PRESENTATION_LAYOUT_SIGNAL"] else 0
@@ -1130,6 +1375,7 @@ def _presentation_rank(sheet: str, ev: dict, title: str) -> tuple:
     return (
         explicit,
         non_critical,
+        valid_path,
         final_output,
         canonical_title,
         presentation_layout,
@@ -1138,7 +1384,6 @@ def _presentation_rank(sheet: str, ev: dict, title: str) -> tuple:
         not_staging,
         conf,
     )
-
 
 def _pick_presentation_candidate(state) -> tuple[str | None, dict]:
     best_name = None
@@ -1176,14 +1421,142 @@ def _pick_presentation_candidate(state) -> tuple[str | None, dict]:
 
     return best_name, best_meta
 
+
+def _tb_rank(sheet: str, ev: dict, final_main_sheet: str | None) -> tuple:
+    explicit = 1 if ev.get("evidence_status") == "explicit" else 0
+    not_hidden = 1 if ev.get("HIDDEN_SIGNAL", 0) == 0 else 0
+    strong_tb = 1 if ev.get("STRONG_TB_PATTERN", 0) == 1 else 0
+    tb = 1 if ev.get("TB_PATTERN", 0) == 1 else 0
+    has_code = 1 if ev.get("HAS_CODE_COLUMN", ev.get("CODE_COLUMN_SIGNAL", 0)) == 1 else 0
+    has_desc = 1 if ev.get("HAS_DESCRIPTION_COLUMN", 0) == 1 else 0
+    has_final = 1 if ev.get("HAS_FINAL_COLUMN", ev.get("FINAL_COLUMN_SIGNAL", 0)) == 1 else 0
+    final_ref = 1 if ev.get("FINAL_REFERENCE_SIGNAL", 0) == 1 else 0
+    tb_ref = 1 if ev.get("TB_REFERENCE_SIGNAL", 0) == 1 else 0
+    referenced_by = 1 if len(ev.get("incoming_refs", []) or []) > 0 else 0
+    path_valid = 1 if ev.get("path_valid", False) else 0
+
+    path = ev.get("path_to_tb", []) or []
+    path_ends_here = 1 if final_main_sheet and path and path[-1] == sheet else 0
+
+    conf = float(ev.get("confidence", 0.0) or 0.0)
+
+    return (
+        explicit,
+        not_hidden,
+        strong_tb,
+        tb,
+        has_code,
+        has_desc,
+        has_final,
+        final_ref,
+        tb_ref,
+        referenced_by,
+        path_valid,
+        path_ends_here,
+        conf,
+    )
+
+
+def _pick_tb_candidate(state, final_main_sheet: str | None) -> tuple[str | None, dict]:
+    best_name = None
+    best_meta = {}
+    best_rank = None
+
+    for sheet in _candidate_sheet_names(state):
+        ev = _extract_nn_evidence(state, sheet)
+
+        if ev.get("evidence_status") != "explicit":
+            continue
+        if ev.get("HIDDEN_SIGNAL", 0) == 1:
+            continue
+        if ev.get("STAGING_PATTERN", 0) == 1:
+            continue
+        if ev.get("aje_source_role", False) is True:
+            continue
+        if ev.get("role_in_graph") == "STAGING":
+            continue
+
+        rank = _tb_rank(sheet, ev, final_main_sheet)
+        if rank[0] == 0:
+            continue
+        if rank[1] == 0:
+            continue
+        if rank[3] == 0 and rank[2] == 0:
+            continue
+
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_name = sheet
+            best_meta = {
+                "confidence": float(ev.get("confidence", 0.0) or 0.0),
+                "path_to_tb": list(ev.get("path_to_tb", []) or []),
+                "path_valid": bool(ev.get("path_valid", False)),
+                "tb_pattern": ev.get("TB_PATTERN", 0),
+                "strong_tb_pattern": ev.get("STRONG_TB_PATTERN", 0),
+                "evidence_status": ev.get("evidence_status"),
+            }
+
+    return best_name, best_meta
+
+def _apply_tb_validation(parsed: dict, state) -> dict:
+    result = dict(parsed)
+
+    final_main_sheet = _clean_sheet_name(result.get("main_sheet_name"))
+    tb_sheet, tb_meta = _pick_tb_candidate(state, final_main_sheet)
+
+    relationship = {
+        "main_to_tb_path": [],
+        "path_valid": False,
+    }
+
+    if final_main_sheet:
+        main_ev = _extract_nn_evidence(state, final_main_sheet)
+        main_path = list(main_ev.get("path_to_tb", []) or [])
+
+        if main_path:
+            relationship["main_to_tb_path"] = main_path
+            relationship["path_valid"] = bool(main_ev.get("path_valid", False))
+
+    if tb_sheet and not relationship["main_to_tb_path"]:
+        relationship["main_to_tb_path"] = [final_main_sheet, tb_sheet] if final_main_sheet else [tb_sheet]
+        relationship["path_valid"] = False
+
+    # hard coherence check
+    if relationship["main_to_tb_path"]:
+        if final_main_sheet and relationship["main_to_tb_path"][0] != final_main_sheet:
+            relationship["path_valid"] = False
+        if tb_sheet and relationship["main_to_tb_path"][-1] != tb_sheet:
+            relationship["path_valid"] = False
+
+    result["is_card_sheet"] = tb_sheet
+    result["technical_tb_sheet"] = tb_sheet
+    result["relationship"] = relationship
+
+    if result.get("decision_mode") == "business_override" and tb_sheet and relationship["path_valid"]:
+        result["decision_mode"] = "business_override_with_tb_validation"
+
+    add_step_log(state, "tb_validation:resolved", {
+        "main_sheet_name": final_main_sheet,
+        "is_card_sheet": tb_sheet,
+        "relationship": relationship,
+    })
+
+    return result
+
 def _apply_business_arbitration(parsed: dict, state) -> dict:
     result = dict(parsed)
 
     technical_winner = _clean_sheet_name(result.get("main_sheet_name"))
+    strong_main_sheets = _pick_display_main_sheets(state, technical_winner, max_count=2)
+
     if not technical_winner:
         result.setdefault("technical_main_sheet", None)
         result.setdefault("presentation_main_sheet", None)
         result.setdefault("business_main_sheet", None)
+        result["technical_main_sheets"] = []
+        result["presentation_main_sheets"] = []
+        result["business_main_sheets"] = []
+        result["main_sheet_names"] = []
         result["decision_mode"] = "no_valid_sheet"
         result["business_arbitration"] = {
             "technical_winner_sheet_type": None,
@@ -1204,7 +1577,6 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
     pc_type = pc_meta.get("sheet_type")
     pc_blocked = pc_meta.get("blocked_by")
     pc_dq = pc_meta.get("disqualification_class")
-    pc_conf = float(pc_meta.get("confidence", 0.0) or 0.0)
     pc_signals = pc_meta.get("signals", {}) or {}
 
     override = False
@@ -1241,12 +1613,20 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
     result["business_main_sheet"] = presentation_sheet
     result["main_sheet_name"] = final_sheet
     result["main_sheet_exists"] = bool(final_sheet)
+
+    # NEW: plural outputs
+    result["technical_main_sheets"] = strong_main_sheets
+    result["presentation_main_sheets"] = strong_main_sheets
+    result["business_main_sheets"] = strong_main_sheets
+    result["main_sheet_names"] = strong_main_sheets
+
     result["decision_mode"] = (
         "business_override" if override else "technical_default"
     )
     result["api_response"] = {
         "main_sheet_exists": bool(final_sheet),
         "main_sheet_name": final_sheet,
+        "main_sheet_names": strong_main_sheets,
     }
 
     result["business_arbitration"] = {
@@ -1262,13 +1642,13 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
         result["reasoning"] = (
             f"Technical winner '{technical_winner}' remains the authoritative "
             f"structural FS sheet, but Layer-6 selected '{presentation_candidate}' "
-            f"as the human-facing final report sheet."
+            f"as the human-facing final report sheet. Strong master sheets: "
+            f"{strong_main_sheets}."
         )
     else:
         result["reasoning"] = (
             f"Technical winner '{technical_winner}' remained final. "
-            f"Presentation candidate was '{presentation_candidate}', "
-            f"but override conditions were not met."
+            f"Strong master sheets: {strong_main_sheets}."
         )
 
     add_step_log(state, "business_arbitration:resolved", {
@@ -1279,6 +1659,7 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
         "presentation_disqualification": pc_dq,
         "override": override,
         "final_sheet": final_sheet,
+        "strong_main_sheets": strong_main_sheets,
     })
 
     return result
@@ -1286,6 +1667,58 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Court helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _pick_display_main_sheets(state, final_main_sheet: str | None, max_count: int = 2) -> list[str]:
+    if not final_main_sheet:
+        return []
+
+    result: list[str] = []
+
+    def _add(sheet: str | None) -> None:
+        if not sheet:
+            return
+        if sheet not in result:
+            result.append(sheet)
+
+    _add(final_main_sheet)
+
+    main_ev = _extract_nn_evidence(state, final_main_sheet)
+    path = list(main_ev.get("path_to_tb", []) or [])
+    path = [p for p in path if _is_real_sheet_name(state, p)]
+
+    for sheet in path[1:-1]:
+        ev = _extract_nn_evidence(state, sheet)
+        title = _sheet_title_from_candidates(state, sheet)
+        name_l = _norm_text(sheet)
+        title_l = _norm_text(title)
+        combined = f"{name_l} || {title_l}"
+
+        if ev.get("evidence_status") != "explicit":
+            continue
+        if ev.get("HIDDEN_SIGNAL", 0) == 1:
+            continue
+        if ev.get("STAGING_PATTERN", 0) == 1:
+            continue
+        if ev.get("aje_source_role", False) is True:
+            continue
+        if ev.get("role_in_graph") == "STAGING":
+            continue
+        if ev.get("role_in_graph") == "TB":
+            continue
+
+        # allow statement-family intermediates like BS / P&L / CF
+        if any(k in combined for k in [
+            "balance sheet", "bs",
+            "profit and loss", "p&l",
+            "cash flow", "cf",
+            "statement of"
+        ]):
+            _add(sheet)
+
+        if len(result) >= max_count:
+            break
+
+    return result[:max_count]
+
 
 def _invoke_agent(agent, msg: str) -> str:
     return agent.invoke(
@@ -1396,6 +1829,13 @@ def analyze_node(state: OrchestratorState) -> OrchestratorState:
         excel_summary = inspect_workbook(file_path)
         main_sheet_result = detect_main_sheet(file_path)
         detector_cand = main_sheet_result.get("main_sheet")
+        workbook_sheet_names = sorted(
+            {
+                str(p.get("sheet_name")).strip()
+                for p in (excel_summary.get("profiles", []) or [])
+                if p.get("sheet_name")
+            }
+        )
 
         prompt = build_analyze_prompt(
             excel_summary=excel_summary,
@@ -1414,6 +1854,7 @@ def analyze_node(state: OrchestratorState) -> OrchestratorState:
             "has_main_sheet": False,
             "analysis": result.content,
             "next_step": "plan",
+            "workbook_sheet_names": workbook_sheet_names,
         }
     except Exception as e:
         add_error_log(state, "analyze_node", e)
@@ -1470,13 +1911,20 @@ def act_node(state: OrchestratorState) -> OrchestratorState:
                 parsed = _parse_json_from_text(out)
 
                 if parsed:
+                    parsed, removed_invalid_refs = _sanitize_research_agent_payload(parsed, state)
                     parsed = _normalize_research_agent_result(parsed)
                     ok, issues = _validate_research_agent_result(parsed)
+
+                    if removed_invalid_refs:
+                        issues = list(issues) + [
+                            f"removed_nonexistent_sheet_references={removed_invalid_refs}"
+                        ]
 
                     add_step_log(state, "act:research_validation", {
                         "task_id": tid,
                         "valid": ok,
                         "issues": issues,
+                        "removed_invalid_refs": removed_invalid_refs,
                         "normalized_main_sheet": parsed.get("main_sheet_name"),
                         "normalized_exists": parsed.get("main_sheet_exists"),
                         "normalized_confidence": parsed.get("confidence"),
@@ -1593,8 +2041,9 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
     4. Restrict synthesis to evidence-backed candidates when possible.
     5. Apply deterministic Python guardrails.
     6. Apply Layer-6 business arbitration.
-    7. Run Layer-6 court in best-effort mode.
-    8. If no valid final sheet survives, force-pick the best PROMAT-consistent fallback.
+    7. Apply TB validation.
+    8. Run Layer-6 court in best-effort mode.
+    9. If no valid final sheet survives, force-pick the best PROMAT-consistent fallback.
     """
     try:
         llm = get_llm()
@@ -1616,6 +2065,7 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
         def _build_forced_fallback_result(reason: str) -> dict:
             chosen_name, chosen_ev = _pick_promat_fallback_candidate(state)
             alt_candidates = []
+
             for sheet in _candidate_sheet_names(state):
                 ev = _extract_nn_evidence(state, sheet)
                 title = _sheet_title_from_candidates(state, sheet)
@@ -1625,6 +2075,9 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                     and stype == "REPORTING_FS"
                     and ev.get("HIDDEN_SIGNAL", 0) == 0
                     and ev.get("TB_PATTERN", 0) == 0
+                    and ev.get("STRONG_TB_PATTERN", 0) == 0
+                    and ev.get("STAGING_PATTERN", 0) == 0
+                    and ev.get("aje_source_role", False) is False
                 ):
                     alt_candidates.append((sheet, ev))
 
@@ -1635,14 +2088,20 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
             )
 
             if chosen_type == "SOURCE_TB" and alt_candidates:
-                alt_candidates.sort(key=lambda x: float(x[1].get("confidence", 0.0) or 0.0), reverse=True)
+                alt_candidates.sort(
+                    key=lambda x: float(x[1].get("confidence", 0.0) or 0.0),
+                    reverse=True,
+                )
                 chosen_name, chosen_ev = alt_candidates[0]
-                
+
             if not chosen_name:
                 return {
                     "main_sheet_exists": False,
                     "main_sheet_name": None,
+                    "is_card_sheet": None,
                     "technical_main_sheet": None,
+                    "presentation_main_sheet": None,
+                    "technical_tb_sheet": None,
                     "business_main_sheet": None,
                     "decision_mode": "no_valid_sheet",
                     "confidence": 0.0,
@@ -1651,12 +2110,16 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                         "main_sheet_exists": False,
                         "main_sheet_name": None,
                     },
+                    "relationship": {
+                        "main_to_tb_path": [],
+                        "path_valid": False,
+                    },
                     "business_arbitration": {
                         "technical_winner_sheet_type": None,
-                        "business_candidate": None,
-                        "business_candidate_sheet_type": None,
-                        "business_candidate_blocked_by": None,
-                        "business_candidate_disqualification_class": None,
+                        "presentation_candidate": None,
+                        "presentation_candidate_sheet_type": None,
+                        "presentation_candidate_blocked_by": None,
+                        "presentation_candidate_disqualification_class": None,
                         "override_applied": False,
                     },
                     "layer6_court_status": "not_run",
@@ -1684,10 +2147,13 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                 "confidence": fallback_conf,
             })
 
-            return {
+            fallback = {
                 "main_sheet_exists": True,
                 "main_sheet_name": chosen_name,
+                "is_card_sheet": None,
                 "technical_main_sheet": chosen_name,
+                "presentation_main_sheet": chosen_name,
+                "technical_tb_sheet": None,
                 "business_main_sheet": chosen_name,
                 "decision_mode": "forced_fallback",
                 "confidence": fallback_conf,
@@ -1700,18 +2166,24 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                     "main_sheet_exists": True,
                     "main_sheet_name": chosen_name,
                 },
+                "relationship": {
+                    "main_to_tb_path": [],
+                    "path_valid": False,
+                },
                 "business_arbitration": {
                     "technical_winner_sheet_type": stype,
-                    "business_candidate": chosen_name,
-                    "business_candidate_sheet_type": stype,
-                    "business_candidate_blocked_by": chosen_ev.get("blocked_by"),
-                    "business_candidate_disqualification_class": dq,
+                    "presentation_candidate": chosen_name,
+                    "presentation_candidate_sheet_type": stype,
+                    "presentation_candidate_blocked_by": chosen_ev.get("blocked_by"),
+                    "presentation_candidate_disqualification_class": dq,
                     "override_applied": False,
                 },
                 "layer6_court_status": "not_run",
                 "fallback_used": True,
                 "fallback_reason": reason,
             }
+            fallback = _apply_tb_validation(fallback, state)
+            return fallback
 
         raw_content = ""
         name = None
@@ -1751,6 +2223,7 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
             guarded = _apply_nn_guardrails(parsed, state)
             l5_payload = dict(guarded)
             arbitrated = _apply_business_arbitration(guarded, state)
+            arbitrated = _apply_tb_validation(arbitrated, state)
 
             try:
                 l6_verdict, l6_judge_output = run_l6_court_session(
@@ -1776,30 +2249,49 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                 "judge_output_preview": safe_preview(l6_judge_output, 400),
             })
 
-            if l6_verdict == "reject_transfer":
+            if l6_verdict in ("reject_transfer", "revise_transfer"):
                 technical_name = l5_payload.get("main_sheet_name")
                 fallback = dict(l5_payload)
                 fallback["technical_main_sheet"] = technical_name
+                fallback["presentation_main_sheet"] = technical_name
                 fallback["business_main_sheet"] = technical_name
                 fallback["decision_mode"] = "technical_default_after_l6_court"
-                fallback["layer6_court_status"] = "rejected_transfer"
+                fallback["layer6_court_status"] = (
+                    "rejected_transfer"
+                    if l6_verdict == "reject_transfer"
+                    else "revise_required"
+                )
+                fallback["layer6_court_judge_output"] = l6_judge_output
                 fallback["business_arbitration"] = {
                     "technical_winner_sheet_type": (
                         _apply_business_arbitration(guarded, state)
                         .get("business_arbitration", {})
                         .get("technical_winner_sheet_type")
                     ),
-                    "business_candidate": None,
-                    "business_candidate_sheet_type": None,
-                    "business_candidate_blocked_by": None,
-                    "business_candidate_disqualification_class": None,
+                    "presentation_candidate": None,
+                    "presentation_candidate_sheet_type": None,
+                    "presentation_candidate_blocked_by": None,
+                    "presentation_candidate_disqualification_class": None,
                     "override_applied": False,
                 }
                 fallback["reasoning"] = (
-                    f"Layer-6 court rejected the L5 → L6 transfer. "
+                    f"Layer-6 court returned '{l6_verdict}'. "
                     f"The system reverted to the Layer-5 technical result "
                     f"'{technical_name}'."
                 )
+
+                display_main_sheets = _pick_display_main_sheets(state, technical_name, max_count=2)
+                fallback["main_sheet_names"] = display_main_sheets
+                fallback["technical_main_sheets"] = display_main_sheets
+                fallback["presentation_main_sheets"] = display_main_sheets
+                fallback["business_main_sheets"] = display_main_sheets
+                fallback["api_response"] = {
+                    "main_sheet_exists": bool(technical_name),
+                    "main_sheet_name": technical_name,
+                    "main_sheet_names": display_main_sheets,
+                }
+
+                fallback = _apply_tb_validation(fallback, state)
                 final_result = fallback
 
             elif l6_verdict == "court_unavailable":
@@ -1842,13 +2334,23 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
             "decision_mode": (
                 _parse_json_from_text(raw_content) or {}
             ).get("decision_mode", "unknown"),
+            "is_card_sheet": final_result.get("is_card_sheet"),
+            "technical_tb_sheet": final_result.get("technical_tb_sheet"),
+            "relationship": final_result.get("relationship"),
         })
 
         return {
             **state,
             "final_answer": raw_content,
             "main_sheet_name": name,
+            "main_sheet_names": final_result.get("main_sheet_names", []),
             "has_main_sheet": exists,
+            "is_card_sheet": final_result.get("is_card_sheet"),
+            "technical_main_sheet": final_result.get("technical_main_sheet"),
+            "presentation_main_sheet": final_result.get("presentation_main_sheet"),
+            "technical_tb_sheet": final_result.get("technical_tb_sheet"),
+            "decision_mode": final_result.get("decision_mode"),
+            "relationship": final_result.get("relationship"),
             "next_step": "export",
         }
 
@@ -1877,10 +2379,13 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                 )
                 dq = _disqualification_class(forced_ev, stype)
 
-                raw_content = json.dumps({
+                fallback = {
                     "main_sheet_exists": True,
                     "main_sheet_name": forced_name,
+                    "is_card_sheet": None,
                     "technical_main_sheet": forced_name,
+                    "presentation_main_sheet": forced_name,
+                    "technical_tb_sheet": None,
                     "business_main_sheet": forced_name,
                     "decision_mode": "forced_fallback_after_exception",
                     "confidence": float(forced_ev.get("confidence", 0.0) or 0.01),
@@ -1894,24 +2399,36 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                         "main_sheet_exists": True,
                         "main_sheet_name": forced_name,
                     },
+                    "relationship": {
+                        "main_to_tb_path": [],
+                        "path_valid": False,
+                    },
                     "business_arbitration": {
                         "technical_winner_sheet_type": stype,
-                        "business_candidate": forced_name,
-                        "business_candidate_sheet_type": stype,
-                        "business_candidate_blocked_by": forced_ev.get("blocked_by"),
-                        "business_candidate_disqualification_class": dq,
+                        "presentation_candidate": forced_name,
+                        "presentation_candidate_sheet_type": stype,
+                        "presentation_candidate_blocked_by": forced_ev.get("blocked_by"),
+                        "presentation_candidate_disqualification_class": dq,
                         "override_applied": False,
                     },
                     "layer6_court_status": "not_run_due_to_exception",
                     "fallback_used": True,
                     "fallback_reason": str(e),
-                }, ensure_ascii=False)
+                }
+                fallback = _apply_tb_validation(fallback, state)
+                raw_content = json.dumps(fallback, ensure_ascii=False)
 
                 return {
                     **state,
                     "final_answer": raw_content,
                     "main_sheet_name": forced_name,
                     "has_main_sheet": True,
+                    "is_card_sheet": fallback.get("is_card_sheet"),
+                    "technical_main_sheet": fallback.get("technical_main_sheet"),
+                    "presentation_main_sheet": fallback.get("presentation_main_sheet"),
+                    "technical_tb_sheet": fallback.get("technical_tb_sheet"),
+                    "decision_mode": fallback.get("decision_mode"),
+                    "relationship": fallback.get("relationship"),
                     "next_step": "export",
                 }
         except Exception as fallback_err:

@@ -6,6 +6,7 @@ import traceback
 from datetime import datetime
 import uuid
 import logging
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from app.server.orc.graph import build_graph
@@ -59,6 +60,85 @@ def _run_graph_for_file(file_path: str) -> dict:
     return graph.invoke({"user_input": file_path})
 
 
+def _extract_final_json(result: dict[str, Any]) -> dict[str, Any]:
+    raw = result.get("final_answer")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _build_single_file_response(input_file: str, result: dict[str, Any]) -> dict[str, Any]:
+    final_json = _extract_final_json(result)
+
+    return {
+        "mode": "single_file",
+        "input_file": input_file,
+        "main_sheet_exists": result.get("has_main_sheet", False),
+        "main_sheet_name": result.get("main_sheet_name"),
+        "is_card_sheet": result.get("is_card_sheet", final_json.get("is_card_sheet")),
+        "technical_main_sheet": result.get(
+            "technical_main_sheet",
+            final_json.get("technical_main_sheet"),
+        ),
+        "presentation_main_sheet": result.get(
+            "presentation_main_sheet",
+            final_json.get("presentation_main_sheet"),
+        ),
+        "technical_tb_sheet": result.get(
+            "technical_tb_sheet",
+            final_json.get("technical_tb_sheet"),
+        ),
+        "decision_mode": result.get(
+            "decision_mode",
+            final_json.get("decision_mode"),
+        ),
+        "relationship": result.get(
+            "relationship",
+            final_json.get("relationship"),
+        ),
+        "json_export_file": result.get("export_file"),
+        "md_export_file": result.get("md_export_file"),
+    }
+
+
+def _build_folder_file_response(excel_file: Path, result: dict[str, Any]) -> dict[str, Any]:
+    final_json = _extract_final_json(result)
+
+    return {
+        "file": str(excel_file),
+        "main_sheet_exists": result.get("has_main_sheet", False),
+        "main_sheet_name": result.get("main_sheet_name"),
+        "is_card_sheet": result.get("is_card_sheet", final_json.get("is_card_sheet")),
+        "technical_main_sheet": result.get(
+            "technical_main_sheet",
+            final_json.get("technical_main_sheet"),
+        ),
+        "presentation_main_sheet": result.get(
+            "presentation_main_sheet",
+            final_json.get("presentation_main_sheet"),
+        ),
+        "technical_tb_sheet": result.get(
+            "technical_tb_sheet",
+            final_json.get("technical_tb_sheet"),
+        ),
+        "decision_mode": result.get(
+            "decision_mode",
+            final_json.get("decision_mode"),
+        ),
+        "relationship": result.get(
+            "relationship",
+            final_json.get("relationship"),
+        ),
+        "json_export_file": result.get("export_file"),
+        "md_export_file": result.get("md_export_file"),
+    }
+
+
 @router.post("/run")
 def run_task(
     file: UploadFile | None = File(default=None),
@@ -103,14 +183,7 @@ def run_task(
 
             logger.info("Graph completed successfully for uploaded file: %s", file.filename)
 
-            return {
-                "mode": "single_file",
-                "input_file": file.filename,
-                "has_main_sheet": result.get("has_main_sheet", False),
-                "main_sheet_name": result.get("main_sheet_name"),
-                "json_export_file": result.get("export_file"),
-                "md_export_file": result.get("md_export_file"),
-            }
+            return _build_single_file_response(file.filename, result)
 
         # ── Folder mode ──────────────────────────────────────────────────────
         folder = Path(folder_path).expanduser()
@@ -147,20 +220,23 @@ def run_task(
             logger.info("Running graph for file in folder mode: %s", excel_file)
             try:
                 result = _run_graph_for_file(str(excel_file))
-                results.append({
-                    "file": str(excel_file),
-                    "has_main_sheet": result.get("has_main_sheet", False),
-                    "main_sheet_name": result.get("main_sheet_name"),
-                    "json_export_file": result.get("export_file"),
-                    "md_export_file": result.get("md_export_file"),
-                })
+                results.append(_build_folder_file_response(excel_file, result))
             except Exception as e:
                 logger.exception("Failed processing file in folder mode: %s", excel_file)
                 debug_trace_file = write_error_debug_file(str(excel_file), e)
                 results.append({
                     "file": str(excel_file),
-                    "has_main_sheet": False,
+                    "main_sheet_exists": False,
                     "main_sheet_name": None,
+                    "is_card_sheet": None,
+                    "technical_main_sheet": None,
+                    "presentation_main_sheet": None,
+                    "technical_tb_sheet": None,
+                    "decision_mode": "no_valid_sheet",
+                    "relationship": {
+                        "main_to_tb_path": [],
+                        "path_valid": False,
+                    },
                     "json_export_file": debug_trace_file,
                     "md_export_file": None,
                     "error": str(e),

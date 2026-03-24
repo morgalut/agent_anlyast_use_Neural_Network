@@ -15,8 +15,16 @@ class OrchestratorState(TypedDict, total=False):
     main_sheet_name: str | None
     has_main_sheet: bool
 
+    # New JSON fields
+    is_card_sheet: str | None
+    technical_main_sheet: str | None
+    presentation_main_sheet: str | None
+    technical_tb_sheet: str | None
+    decision_mode: str | None
+    relationship: Dict[str, Any]
+
     export_file: str
-    md_export_file: str 
+    md_export_file: str
     next_step: str
     error: Optional[str]
 

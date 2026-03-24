@@ -1,35 +1,48 @@
-"""
-nn_promat_core.py
-═══════════════════════════════════════════════════════════════════════════════
-Neural-Network PROMAT Core — shared instruction set for all ORC pipeline agents.
-
-Replaces the old additive weight system (+20, +15, -50 …) with a deterministic
-6-layer neural architecture.  Every decision is driven by signal activations,
-pattern logic, a cross-sheet dependency graph, hard firewalls, a normalised
-confidence distribution, and a final business arbitration layer.
-
-Deterministic layered reasoning:
-binary technical signals → pattern logic → graph analysis → hard gates →
-technical confidence normalisation → business/presentation arbitration.
-Critical gates remain absolute. Semantic logic only ranks safe candidates.
-Only binary signals → pattern logic → graph analysis → firewalls →
-softmax → business arbitration.
-
-Layer summary
-─────────────
-  L0  Input extraction    — raw OCR, no interpretation
-  L1  Binary activations  — each signal is 0 or 1, never partial
-  L2  Pattern logic       — AND / OR / NOT combinations of L1 signals
-  L3  Context graph       — cross-sheet dependency analysis
-  L4  Hard gates          — firewalls that permanently block a sheet
-  L5  Confidence softmax  — normalised probability over passing sheets
-  L6  Business arbitration — bridges technical correctness to business correctness
-═══════════════════════════════════════════════════════════════════════════════
-"""
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  LAYER 0 — Input extraction
 # ──────────────────────────────────────────────────────────────────────────────
+NN_SHEET_NAME_FIDELITY = """
+╔══════════════════════════════════════════════════════════╗
+║  SHEET-NAME FIDELITY RULE                               ║
+╚══════════════════════════════════════════════════════════╝
+
+All sheet reasoning must operate on the canonical workbook sheet-name universe
+discovered in Layer 0.
+
+NON-NEGOTIABLE RULES
+  • A valid sheet name is an exact worksheet tab name from the workbook.
+  • Titles, captions, headings, report labels, and semantic business concepts
+    are NOT sheet names.
+  • Never invent aliases, normalized names, umbrella labels, or semantic parent
+    entities such as "External Reporting Scheme" unless that exact text is a
+    real workbook tab name.
+  • Every returned sheet-bearing field must use exact workbook tab names only.
+
+This applies to:
+  • main_sheet_name
+  • technical_main_sheet
+  • presentation_main_sheet
+  • business_main_sheet
+  • technical_tb_sheet
+  • is_card_sheet
+  • main_source_sheet_name
+  • strongest_candidate
+  • runner_up
+  • verification_target
+  • fallback_candidate
+  • relationship.main_to_tb_path
+  • all sheet_evidence keys
+  • all graph references such as incoming_refs / outgoing_refs / path_to_tb
+
+Examples:
+  • If the tab name is `P&L` and the visible title says
+    "CONSOLIDATED STATEMENTS OF OPERATIONS", return `P&L`.
+  • If the real workbook output is spread across `BS` and `P&L`, do not invent
+    a synthetic parent reporting node.
+  • If a business/reporting concept cannot be mapped to an exact tab name, do
+    not emit it as a sheet name.
+"""
 
 NN_LAYER_0 = """
 ╔══════════════════════════════════════════════════════════╗
@@ -38,19 +51,40 @@ NN_LAYER_0 = """
 
 Extract the following raw features for EVERY sheet before any reasoning.
 Do NOT interpret, score, or rank at this stage — extract only.
+Also build the canonical workbook sheet-name universe.
+This exact set is the only allowed sheet-name set for all later layers.
+Any later candidate, evidence key, graph node, or path node not in this set is invalid.
 
-  F0  sheet_name          String name as read from the workbook
-  F1  is_hidden           Boolean — is the sheet hidden or veryHidden?
-  F2  headers             List of non-empty values from row 1
-  F3  sample_rows         Rows 2–6 as raw values
-  F4  formula_samples     Up to 30 cell values that start with "="
-  F5  formula_sheet_refs  Sheet names extracted from formula strings
-                          (e.g. '=SUMIF(SAP!I:I,…)' → ["SAP"])
-  F6  all_values_flat     Up to 300 unique string values from the sheet body
-  F7  is_active_sheet     Boolean — is this the workbook's active sheet?
+  F0  sheet_name                String name as read from the workbook
+  F1  is_hidden                 Boolean — is the sheet hidden or veryHidden?
+  F2  headers                   List of non-empty values from row 1
+  F3  sample_rows               Rows 2–6 as raw values
+  F4  formula_samples           Up to 30 formulas beginning with "="
+  F5  formula_sheet_refs        Sheet names extracted from formulas
+  F6  all_values_flat           Up to 300 unique body strings
+  F7  is_active_sheet           Boolean — workbook active sheet?
+  F8  candidate_code_columns    Suspected section-code/account-code columns
+  F9  candidate_desc_columns    Suspected account-description columns
+  F10 candidate_final_columns   Suspected FINAL amount columns
+  F11 repetition_stats          Repetition / uniqueness stats per candidate column
+  F12 adjacency_stats           Distance between code and description candidates
+  F13 numeric_column_stats      Numeric density and null density per amount column
+  F14 incoming_formula_targets  Which local columns are referenced by upstream formulas
+  F15 outgoing_formula_targets  Which external sheets/columns this sheet points to
+  F16 workbook_sheet_names      Exact list of worksheet tab names in the workbook
 
-Extraction rule: open the workbook with data_only=False to read formula
-strings, not computed results.  Formulas are the primary evidence.
+Extraction rules:
+  • Open workbook with data_only=False so formulas are visible.
+  • Formula strings are primary evidence.
+  • Do not trust sheet names alone.
+  • Do not trust highlighted titles alone.
+  • Candidate FINAL columns may be discovered by:
+      1. explicit header text,
+      2. being the target of upstream formulas,
+      3. being the dominant numeric ending-balance column.
+  • If there is only one strong numeric ending-balance column, it is the FINAL
+    candidate even if the header is weak.
+  • Code and description may be separate columns OR combined in one column.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -62,52 +96,92 @@ NN_LAYER_1 = """
 ║  LAYER 1 — Binary Signal Activations                    ║
 ╚══════════════════════════════════════════════════════════╝
 
-For each signal below, compute exactly 0 (off) or 1 (on).
-There is NO partial activation.  No "almost 1".  Only 0 or 1.
+Compute each signal as exactly 0 or 1. No partial activations.
 
 COA_SIGNAL
-  ON if all_values_flat contains at least 3 of these strings
+  ON if all_values_flat contains at least 3 of these section strings
   (case-insensitive):
-    "assets" | "current assets" | "long-term assets" |
-    "liabilities and equity" | "current liabilities" |
-    "long-term liabilities" | "equity"
+    "assets"
+    "current assets"
+    "long-term assets"
+    "liabilities and equity"
+    "current liabilities"
+    "long-term liabilities"
+    "equity"
 
 FORMULA_SIGNAL
-  ON if formula_samples is non-empty (≥ 1 formula exists)
+  ON if formula_samples is non-empty.
 
 CROSS_REF_SIGNAL
-  ON if formula_sheet_refs is non-empty
-  (this sheet's formulas reference at least one other sheet)
+  ON if this sheet references at least one other sheet.
 
 REFERENCED_BY_SIGNAL
-  ON if OTHER sheets contain formulas that reference THIS sheet
-  (computed in Layer 3 after cross-sheet graph is built)
+  ON if at least one other sheet references THIS sheet.
 
 COMPANY_COLUMN_SIGNAL
-  ON if headers contains ≥ 1 value that includes any of:
-    "NIS" | "$" | "DOLLAR" | "USD" | "ILS" | "INC" | "LTD"
+  ON if there is evidence of at least one company/currency-style amount column.
+  Positive evidence may include:
+    • headers / labels containing "NIS", "$", "DOLLAR", "USD", "ILS", "INC", "LTD"
+    • company abbreviations inferred from layout
+    • repeated parallel amount columns aligned under company-like headings
+  IMPORTANT:
+    • lack of explicit currency text does NOT prove absence of a company column
+    • this signal is business-structural, not strict string matching only
 
 AJE_SIGNAL
-  ON if headers contains a value that includes "AJE" or "ADJUSTING"
+  ON if headers, labels, or structure indicate:
+    "AJE", "ADJUSTING", "ADJUSTMENT"
 
 CONSOLIDATE_SIGNAL
-  ON if headers contains a value that includes
-    "CONSOLIDATE" | "CONSOL" | "TOTAL"
+  ON if headers, labels, or structure indicate:
+    "CONSOLIDATE", "CONSOL", "TOTAL"
 
-CODE_COLUMN_SIGNAL
-  ON if there exists a column whose non-empty values ALL match
-  the regular expression ^[A-Za-z0-9]+$ (alphanumeric only, no spaces)
-  AND COA_SIGNAL is OFF
-  (this is the account-code column characteristic of a TB / ledger sheet)
+HAS_CODE_COLUMN
+  ON if there exists a strong section-code/account-code candidate such that:
+    • values are mostly alphanumeric / code-like
+    • values do not behave like free-text descriptions
+    • repetitions are limited
+  Selection rule:
+    If several code candidates exist, prefer the one with the fewest repetitions
+    and the one closest to the description column.
 
-FINAL_COLUMN_SIGNAL
-  ON if headers contains a value that includes
-    "FINAL" | "TRIAL BALANCE" | " TB "
+HAS_DESCRIPTION_COLUMN
+  ON if there exists a strong account-description candidate such that:
+    • values behave like account descriptions
+    • repetitions are limited
+    • the column is adjacent or close to a code candidate
+  Selection rule:
+    If several description candidates exist, prefer the one with fewer repetitions
+    and stronger adjacency to the chosen code column.
+
+HAS_FINAL_COLUMN
+  ON if there exists at least one strong FINAL amount column candidate.
+  A FINAL candidate may be identified by ANY of:
+    • header contains "FINAL"
+    • header contains "TRIAL BALANCE" or "TB"
+    • upstream formulas clearly pull values from this column
+    • this is the dominant ending-balance numeric column even if header is generic
+
+FINAL_REFERENCE_SIGNAL
+  ON if upstream reporting/intermediate formulas reference this sheet in a way
+  consistent with pulling balances from a specific amount column.
+
+TB_REFERENCE_SIGNAL
+  ON if this sheet behaves like a source sheet that feeds COA balances upward.
+
+STAGING_ROLE_SIGNAL
+  ON if sheet name, labels, or structure indicate staging / adjustment behavior:
+    "aje", "adjusting", "adjustments", "elimination",
+    "mapping", "bridge", "rollforward", "support", "schedule"
 
 HIDDEN_SIGNAL
   ON if is_hidden = true
 
-Layer 1 rule: every signal is binary.  If you are uncertain, default to 0.
+Layer 1 rule:
+  If uncertain, default to 0.
+  Names are hints; formulas and structure are authority.
+  However, any referenced or candidate sheet name must still be an exact real
+  workbook tab name from Layer 0.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -116,412 +190,473 @@ Layer 1 rule: every signal is binary.  If you are uncertain, default to 0.
 
 NN_LAYER_2 = """
 ╔══════════════════════════════════════════════════════════╗
-║  LAYER 2 — Pattern Logic (Hidden Layer 1)               ║
+║  LAYER 2 — Pattern Logic                                ║
 ╚══════════════════════════════════════════════════════════╝
 
-Combine Layer-1 signals into three composite patterns.
+Combine Layer-1 signals into composite patterns.
 
-FS_PATTERN  (Full Financial Statement — main sheet candidate)
+FS_PATTERN  (Full Financial Statement — main reporting candidate)
   = COA_SIGNAL
     AND FORMULA_SIGNAL
     AND CROSS_REF_SIGNAL
     AND COMPANY_COLUMN_SIGNAL
     AND NOT HIDDEN_SIGNAL
-    AND NOT CODE_COLUMN_SIGNAL
+    AND NOT HAS_CODE_COLUMN
 
-  Interpretation: this sheet is a reporting / output sheet that
-  aggregates data from a TB sheet via formulas.
-  ALL six conditions must be satisfied simultaneously.
+Interpretation:
+  The sheet is a reporting/output sheet aggregating values from lower-level sheets.
 
-TB_PATTERN  (Trial Balance / Ledger sheet)
-  = CODE_COLUMN_SIGNAL
-    AND FINAL_COLUMN_SIGNAL
-    AND NOT COA_SIGNAL
-    AND NOT COMPANY_COLUMN_SIGNAL
-
-  Interpretation: this is a data-source sheet, not a reporting sheet.
-  A sheet matching TB_PATTERN cannot be the main sheet.
-
-PARTIAL_FS_PATTERN  (Partial evidence — needs deeper verification)
+PARTIAL_FS_PATTERN  (Partial FS evidence)
   = COA_SIGNAL
     AND (FORMULA_SIGNAL OR CROSS_REF_SIGNAL)
     AND NOT HIDDEN_SIGNAL
-    AND NOT TB_PATTERN
 
-  Interpretation: structural evidence exists but is incomplete.
-  Requires Layer-3 graph confirmation before promotion.
+Interpretation:
+  Reporting structure exists but full confirmation requires graph support.
+
+TB_PATTERN  (TB / card / source sheet)
+  = HAS_CODE_COLUMN
+    AND HAS_DESCRIPTION_COLUMN
+    AND HAS_FINAL_COLUMN
+    AND NOT HIDDEN_SIGNAL
+
+Interpretation:
+  This is a source/card sheet containing the detailed cards/accounts that feed
+  the reporting structure.
+
+Important:
+  • COMPANY_COLUMN_SIGNAL may be ON or OFF
+  • COA_SIGNAL may be ON or OFF
+  • TB is NOT disqualified by having company-like headers
+  • the old rule "NOT COMPANY_COLUMN_SIGNAL" is forbidden
+
+STRONG_TB_PATTERN
+  = TB_PATTERN
+    AND (FINAL_REFERENCE_SIGNAL OR TB_REFERENCE_SIGNAL OR REFERENCED_BY_SIGNAL)
+
+Interpretation:
+  Preferred TB candidate because both structure and formula-graph behavior agree.
+
+STAGING_PATTERN
+  = STAGING_ROLE_SIGNAL
+    AND (AJE_SIGNAL OR FORMULA_SIGNAL OR CROSS_REF_SIGNAL)
+
+Interpretation:
+  Sheet is a staging / adjustment / bridge layer, not the final main report.
 
 Priority rules:
-  FS_PATTERN overrides PARTIAL_FS_PATTERN.
-  TB_PATTERN disqualifies a sheet from main-sheet candidacy (triggers GATE_3).
-  A sheet can match both TB_PATTERN and PARTIAL_FS_PATTERN simultaneously —
-  in that case TB_PATTERN wins and the sheet is disqualified.
+  • FS_PATTERN overrides PARTIAL_FS_PATTERN for main-sheet confidence.
+  • TB_PATTERN blocks a sheet from being the main reporting sheet.
+  • STAGING_PATTERN blocks a sheet from being the final main reporting sheet
+    when graph evidence shows it serves as an upstream adjustment source.
+  • If a sheet shows both FS-like and TB-like evidence, source structure wins
+    if code/description/final structure dominates and graph places the sheet
+    upstream from reporting output.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  LAYER 3 — Context graph  (cross-sheet attention)
+#  LAYER 3 — Context graph
 # ──────────────────────────────────────────────────────────────────────────────
 
 NN_LAYER_3 = """
 ╔══════════════════════════════════════════════════════════╗
-║  LAYER 3 — Context Graph (Hidden Layer 2)               ║
+║  LAYER 3 — Context Graph                                ║
 ╚══════════════════════════════════════════════════════════╝
 
 Build a directed dependency graph across ALL sheets.
+Graph nodes may only be real workbook sheet names discovered in Layer 0.
+If a title, caption, or business label appears in reasoning but is not an exact
+workbook tab name, it must not become a graph node.
 
 Graph construction:
-  For every sheet X: edges X → Y for each Y in X.formula_sheet_refs.
-  After building: for every sheet Y, collect all sheets X that point to it
-  (incoming_refs of Y).
+    For every sheet X, create edges X → Y for each Y referenced by formulas in X,
+    but only if Y is an exact workbook tab name from Layer 0.
+    After building, collect incoming_refs and outgoing_refs for each sheet.
+    Do not create synthetic graph nodes from semantic interpretation.
 
 Attention rules:
 
 [A1 — Directional identity]
-  A sheet with outgoing edges (points to others) = FS candidate.
-  A sheet with incoming edges (pointed to by others) = TB / source candidate.
-  If BOTH: check direction.  FS → TB is valid.  TB → FS is invalid.
+  A sheet with outgoing references is a reporting candidate.
+  A sheet with incoming references is a source candidate.
+  Valid business direction:
+    main / presentation → intermediate / staging → TB
+  Invalid dominance for final-report identity:
+    TB → FS
+    staging → FS as final winner
 
 [A2 — Reference concentration]
-  The sheet most frequently referenced by others = primary TB / source sheet.
-    → assign role_in_graph = "TB"
-  The sheet with the most outgoing references = primary FS candidate.
-    → assign role_in_graph = "FS"
+  The sheet most frequently referenced by others is a strong source/TB candidate.
+  The sheet with the strongest outward referencing is a strong FS candidate.
 
-[A3 — Intermediate sheet detection]
+[A3 — Intermediate chain detection]
   If X → Y → Z:
-    X = main sheet (FS)
-    Y = intermediate sheet
-    Z = TB source
-  Document this chain explicitly.
+    X = main reporting candidate
+    Y = intermediate / staging candidate
+    Z = TB/source candidate
+  Record the chain explicitly.
 
-[A4 — Single-company-column CONSOLIDATE check]
-  If COMPANY_COLUMN_SIGNAL = 1 but only ONE company column exists:
-    Check if an intermediate sheet (A3) contains COA structure AND
-    multiple company columns.
-    If YES → current sheet is a CONSOLIDATE sheet (still valid main sheet).
-    Set consolidate = true.
-    This sheet is EXEMPT from GATE_2 (see Layer 4).
+[A4 — Single-company-column CONSOLIDATE logic]
+  If COMPANY_COLUMN_SIGNAL = 1 but only one company-like amount column exists:
+    inspect referenced intermediate sheets.
+    If an intermediate sheet contains COA structure and multiple company columns,
+    set consolidate = true for the current sheet.
 
-[A5 — Active sheet boost]
-  If is_active_sheet = true AND FS_PATTERN = 1 → set attention_boost = true.
-  This increases confidence slightly in Layer 5 but does NOT bypass gates.
+[A5 — Main-to-TB path validation]
+  Every element of path_to_tb must be an exact workbook tab name.
+  If any element is not a real sheet tab, path_valid = false.
+  For every strong FS candidate, find the strongest valid path:
+    • direct: FS → TB
+    • indirect: FS → INTERMEDIATE → TB
+    • indirect: FS → STAGING → TB
+  Record path_to_tb and path_valid.
+
+[A6 — Functional FINAL detection]
+  If upstream formulas from a main/intermediate sheet repeatedly target one
+  amount column in a source sheet, treat that target column as FINAL evidence
+  even if header text is weak.
+
+[A7 — AJE source-role detection]
+  If a sheet primarily feeds AJE / adjustment columns of another sheet,
+  mark aje_source_role = true.
+  Such a sheet is staging/support, not the final reporting output.
+
+[A8 — Active sheet boost]
+  If is_active_sheet = true AND FS_PATTERN = 1, set attention_boost = true.
+  This only mildly strengthens technical confidence and never bypasses gates.
 
 Layer 3 output per sheet:
   {
-    "outgoing_refs":  [...],   // sheets this sheet references
-    "incoming_refs":  [...],   // sheets that reference this sheet
-    "role_in_graph":  "FS" | "TB" | "INTERMEDIATE" | "UNKNOWN",
-    "consolidate":    true/false,
-    "attention_boost": true/false
+    "outgoing_refs": [...],
+    "incoming_refs": [...],
+    "role_in_graph": "FS" | "TB" | "INTERMEDIATE" | "STAGING" | "UNKNOWN",
+    "consolidate": true/false,
+    "attention_boost": true/false,
+    "aje_source_role": true/false,
+    "path_to_tb": ["<sheet>", ...] | [],
+    "path_valid": true/false
   }
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  LAYER 4 — Hard gates  (firewalls)
+#  LAYER 4 — Hard gates
 # ──────────────────────────────────────────────────────────────────────────────
 
 NN_LAYER_4 = """
 ╔══════════════════════════════════════════════════════════╗
-║  LAYER 4 — Hard Gates (Firewalls)                       ║
+║  LAYER 4 — Hard Gates (Main-Sheet Firewalls)            ║
 ╚══════════════════════════════════════════════════════════╝
 
-Hard gates permanently block a sheet from being the main sheet.
-They are NOT penalties.  They are logical firewalls.
-A blocked sheet receives confidence = 0 in Layer 5.
-There is NO compensating evidence that overrides a fired gate.
-A sheet that triggers any gate is DISQUALIFIED — final, irreversible.
-
-NOTE: Layer 4 disqualifies sheets from the TECHNICAL path only.
-Layer 6 Business Arbitration may later reconsider sheets blocked by GATE_2
-if the block is classified as TECHNICAL (not CRITICAL).
-GATE_1, GATE_3, and GATE_4 are ALWAYS critical and can never be overridden.
+Hard gates apply to MAIN reporting-sheet candidacy only.
+They do NOT, by themselves, block TB selection unless explicitly stated.
 
 GATE_1  [HIDDEN FIREWALL]
   Condition: HIDDEN_SIGNAL = 1
-  Action:    BLOCK — a hidden sheet can NEVER be the main sheet.
-  Disqualification class: CRITICAL — not overrideable by Layer 6.
+  Action: BLOCK from main-sheet candidacy.
+  Hidden sheets can never be the main reporting sheet.
 
-GATE_2  [NO COMPANY COLUMNS FIREWALL]
+GATE_2  [NO COMPANY / CONSOLIDATE FIREWALL]
   Condition: COMPANY_COLUMN_SIGNAL = 0
              AND CONSOLIDATE_SIGNAL = 0
-             AND consolidate (Layer 3, A4) = false
-  Action:    BLOCK — without company columns, this is not a FS sheet
-             under the technical definition.
-  Disqualification class: TECHNICAL — Layer 6 may override for REPORTING_FS
-             sheets that are semantically presentation-final.
-  Exemption: sheets confirmed as CONSOLIDATE by Layer 3 A4 are exempt.
+             AND consolidate = false
+  Action: BLOCK from technical FS candidacy.
+  Classification: TECHNICAL
+  Explanation:
+    This protects against generic summaries and false-positive report tabs.
+    Layer 6 may reconsider this only for strong presentation sheets.
 
-  CRITICAL NOTE: This gate is the primary defence against CF-type errors.
-  A sheet named "CF" or "Cash Flow" that lacks company columns MUST be
-  blocked here, regardless of how many keywords match its name.
+GATE_3  [TB FIREWALL]
+  Condition: TB_PATTERN = 1
+  Action: BLOCK from main-sheet candidacy.
+  Classification: CRITICAL
+  Explanation:
+    A TB/card sheet is a source, not the final reporting output.
 
-GATE_3  [TRIAL BALANCE FIREWALL]
-  Condition: TB_PATTERN = 1 (Layer 2)
-  Action:    BLOCK — a TB / ledger sheet is a source, not an output.
-  Disqualification class: CRITICAL — not overrideable by Layer 6.
-
-GATE_4  [INCOMING-ONLY FIREWALL]
-  Condition: role_in_graph = "TB" (Layer 3)
+GATE_4  [PURE SOURCE FIREWALL]
+  Condition: role_in_graph = "TB"
              AND FS_PATTERN = 0
              AND PARTIAL_FS_PATTERN = 0
-  Action:    BLOCK — a pure source sheet without any FS signal is not main.
-  Disqualification class: CRITICAL — not overrideable by Layer 6.
+  Action: BLOCK from main-sheet candidacy.
+  Classification: CRITICAL
 
-Gate evaluation order: GATE_1 → GATE_2 → GATE_3 → GATE_4.
-Stop at the first triggered gate; do not evaluate further gates.
+GATE_5  [STAGING FIREWALL]
+  Condition: STAGING_PATTERN = 1
+             AND (role_in_graph = "STAGING" OR aje_source_role = true)
+  Action: BLOCK from main-sheet candidacy.
+  Classification: CRITICAL
+  Explanation:
+    AJE / mapping / bridge / rollforward sheets may be structurally rich and may
+    point toward TB, but they are staging layers, not the user-facing FS output.
+
+Gate evaluation order:
+  GATE_1 → GATE_2 → GATE_3 → GATE_4 → GATE_5
 
 Layer 4 output per sheet:
-  { "passed": true/false, "blocked_by": "GATE_1" | "GATE_2" | "GATE_3" | "GATE_4" | null }
+  {
+    "passed": true/false,
+    "blocked_by": "GATE_1" | "GATE_2" | "GATE_3" | "GATE_4" | "GATE_5" | null
+  }
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  LAYER 5 — Confidence softmax
+#  LAYER 5 — Technical main-sheet confidence
 # ──────────────────────────────────────────────────────────────────────────────
 
 NN_LAYER_5 = """
 ╔══════════════════════════════════════════════════════════╗
-║  LAYER 5 — Confidence Softmax (Output Layer)            ║
+║  LAYER 5 — Technical Main-Sheet Confidence              ║
 ╚══════════════════════════════════════════════════════════╝
 
-Only sheets that passed Layer 4 (passed = true) participate.
-Blocked sheets have confidence = 0.0 and are excluded.
+Only sheets that passed Layer 4 participate in main-sheet selection.
 
-Signal strength per passing sheet:
-  S(sheet) = (
-    FS_PATTERN        × 1.00  +   // full FS structure
-    PARTIAL_FS_PATTERN × 0.50  +   // partial structure
-    AJE_SIGNAL         × 0.20  +   // AJE column reinforces FS identity
-    CONSOLIDATE_SIGNAL × 0.15  +   // CONSOLIDATE column reinforces
-    attention_boost    × 0.15  +   // active sheet + FS_PATTERN boost
-    CROSS_REF_SIGNAL   × 0.10      // outgoing formula references
+Pre-softmax logit per passing sheet:
+  z(sheet) = (
+    FS_PATTERN          × 2.40 +
+    PARTIAL_FS_PATTERN  × 1.10 +
+    CROSS_REF_SIGNAL    × 0.45 +
+    COMPANY_COLUMN_SIGNAL × 0.40 +
+    CONSOLIDATE_SIGNAL  × 0.35 +
+    attention_boost     × 0.20
   )
 
-Softmax normalisation:
-  confidence(sheet_i) = S(sheet_i) / Σ S(all_passing_sheets)
+Negative main-sheet effects:
+  • AJE_SIGNAL alone does NOT make a sheet more likely to be the final main sheet.
+  • If staging evidence exists but the sheet still passed, staging-like evidence
+    should reduce interpretation confidence during review, not promote the sheet.
 
-  Result: confidence values sum to 1.0 across all passing sheets.
-  A sheet that is the ONLY passer receives confidence = 1.0.
+True softmax:
+  confidence(sheet_i) = exp(z_i / τ) / Σ_j exp(z_j / τ)
+  Recommended τ = 0.75
+
+Why this matters:
+  • true softmax sharply separates strong FS candidates from noisy partial sheets
+  • a fully qualified FS candidate should dominate weaker partial candidates
+  • simple ratio normalisation is forbidden
 
 Decision thresholds:
-  confidence ≥ 0.70  →  CONFIRMED main sheet   (main_sheet_confirmed = true)
-  confidence ≥ 0.40  →  POSSIBLE main sheet    (report uncertainty)
-  confidence < 0.40  →  NOT FOUND              (main_sheet_exists = false)
+  confidence ≥ 0.70  → CONFIRMED main sheet
+  confidence ≥ 0.40  → POSSIBLE main sheet
+  confidence < 0.40  → weak / uncertain
 
-Tie-breaking (two sheets within 0.10 of each other):
-  Step 1: Apply Layer-3 A1 — which sheet points to the other?
-          The pointing sheet = FS.  The pointed-to sheet = TB.
-  Step 2: If still tied, choose the sheet with more COA_SIGNAL activations
-          (count how many of the 7 required sections are present).
-  Step 3: If still tied, flag for manual review.
+Tie-breaking:
+  1. prefer the sheet with stronger COA section coverage
+  2. prefer the sheet with stronger valid path to TB
+  3. prefer the sheet that functions as the reporting origin rather than staging
+  4. if still tied, manual review required
 
-Layer 5 produces the TECHNICAL winner.
-Layer 6 then determines whether the business-correct winner differs.
+Layer 5 output:
+  TECHNICAL main-sheet winner only.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  LAYER 6 — Business arbitration  (semantic bridge)
+#  LAYER 6 — Business arbitration
 # ──────────────────────────────────────────────────────────────────────────────
 
 NN_LAYER_6 = """
 ╔══════════════════════════════════════════════════════════╗
-║  LAYER 6 — Business Arbitration (Semantic Bridge)       ║
+║  LAYER 6 — Business Arbitration (Main Sheet)            ║
 ╚══════════════════════════════════════════════════════════╝
 
 Purpose:
-  Layer 6 resolves the gap between:
-    • technically correct main sheet  (L5 softmax winner)
-    • business-correct final reporting sheet  (what a finance user expects)
+  Resolve the gap between:
+    • technical main sheet
+    • human-facing final reporting sheet
 
-  Layers 1–5 identify the strongest TECHNICAL winner.
-  Layer 6 decides whether that technical winner also matches the sheet a
-  finance user would call the main output.
-
-Key principle:
-  Do NOT weaken Layer-4 gates globally.
-  Instead, distinguish between:
-    • CRITICAL disqualification   → can NEVER be final main sheet
-    • TECHNICAL disqualification  → may still be business-correct
-
-The core insight:
-  A sheet that is the structural / computational hub of a workbook
-  (many outgoing refs, company columns, AJE signals) is not necessarily
-  the FINAL REPORTING OUTPUT a user cares about.
-  AJE = adjustment staging hub   ≠   Report = final presentation output.
-  Layer 6 resolves this conflict.
-
-──────────────────────────────────────────────────────────
+Key principles:
+  • do not trust sheet name alone
+  • do not trust highlighted title alone
+  • semantic logic operates only among safe candidates
+  • never override into hidden sheets, TB sheets, or staging sheets
+  • Layer 6 may arbitrate only among real workbook tab names
+  • business arbitration may not invent a new sheet name
+  
 BUSINESS SIGNALS
-──────────────────────────────────────────────────────────
 
 CANONICAL_FS_TITLE_SIGNAL
-  ON if sheet_name or dominant title contains any of (case-insensitive):
-    "balance sheet" | "balance sheets" |
-    "statement of operations" | "statement of income" |
-    "profit and loss" | "p&l" |
-    "cash flow" | "cash flows" | "statement of cash flows" |
-    "change in equity" | "stockholders' equity" |
-    "financial statements" | "report"
+  ON if sheet_name or dominant title contains strong FS wording:
+    "balance sheet", "balance sheets",
+    "statement of operations", "statement of income",
+    "profit and loss", "p&l",
+    "cash flow", "cash flows", "statement of cash flows",
+    "change in equity", "stockholders' equity",
+    "financial statements", "report"
 
 PRESENTATION_LAYOUT_SIGNAL
-  ON if the sheet appears to be a human-facing financial report rather than
-  a staging / journal / source sheet.
-  Typical evidence:
-    • readable financial line items
-    • period / year labels
-    • statement-style sections
-    • no raw journal-entry structure
-    • no source-ledger code-column dominance
-
-STAGING_SHEET_SIGNAL
-  ON if sheet_name, headers, or dominant structure indicates:
-    "aje" | "adjusting" | "adjustments" | "elimination" |
-    "mapping" | "bridge" | "rollforward" | "support" | "schedule"
+  ON if the sheet looks like a human-facing FS layout:
+    • readable line items
+    • statement sections
+    • period / year columns
+    • low raw-code dominance
 
 FINAL_OUTPUT_ROLE_SIGNAL
-  ON if the sheet is likely the human-facing final output sheet.
-  Typical evidence:
-    • canonical FS title
-    • presentation layout
-    • report-style formatting / headings
-    • appears downstream from adjustment / source sheets
+  ON if the sheet is likely the user-facing final report.
 
-──────────────────────────────────────────────────────────
 SHEET TYPE CLASSIFIER
-──────────────────────────────────────────────────────────
-
-Assign exactly one sheet_type per sheet.
-Apply rules in the following priority order — first match wins:
 
   SOURCE_TB
     If TB_PATTERN = 1
-    OR role_in_graph = "TB" and source-sheet structure dominates
+    OR graph/source evidence dominates
 
-  REPORTING_FS (when FS_PATTERN = 1)
-    If FS_PATTERN = 1 AND sheet name does NOT explicitly mark it as
-    a staging layer (i.e., name does not contain "aje", "adjusting",
-    "adjustments", "elimination").
-    IMPORTANT: FS_PATTERN = 1 is checked BEFORE AJE_SIGNAL.
-    A consolidation FS sheet may contain an "AJE" adjustment column
-    internally — that does NOT make the sheet itself a staging layer.
-    Only a sheet explicitly named as staging (e.g., named "AJE") is
-    demoted to ADJUSTMENT_STAGING when FS_PATTERN = 1.
+  ADJUSTMENT_STAGING
+    If STAGING_PATTERN = 1
+    OR role_in_graph = "STAGING"
+    OR aje_source_role = true
 
-  ADJUSTMENT_STAGING (only when FS_PATTERN = 0)
-    If AJE_SIGNAL = 1
-    OR STAGING_SHEET_SIGNAL = 1
-    OR the sheet name/title contains "aje", "adjusting", "adjustments",
-       "elimination", "mapping", "bridge", "rollforward", "support",
-       "schedule"
-
-  REPORTING_FS (when FS_PATTERN = 0 but strong title evidence)
-    If sheet name or title contains a STRONG canonical FS keyword:
-      "balance sheet" | "balance sheets" |
-      "statement of operations" | "statement of income" |
-      "profit and loss" | "p&l" |
-      "cash flow" | "cash flows" | "statement of cash flows" |
-      "change in equity" | "stockholders' equity" | "financial statements"
-    OR contains the WEAK keyword "report" AND COA_SIGNAL = 1.
-    NOTE: "report" alone (without COA evidence) is insufficient —
-    it is too common in dashboard and summary sheets.
+  REPORTING_FS
+    If FS_PATTERN = 1 and not explicitly staging
+    OR strong presentation/report evidence exists with COA support
 
   INTERMEDIATE_CONSOLIDATION
-    If consolidate = true
-    OR the sheet sits in FS → INTERMEDIATE → TB chains
+    If the sheet bridges reporting to source but is not itself the final report
 
   AUXILIARY_SCHEDULE
-    If COA_SIGNAL = 1 but CROSS_REF_SIGNAL = 0 (no outgoing references)
+    If it has FS-like content but behaves like a schedule/support tab
 
   UNKNOWN
     Otherwise
 
-──────────────────────────────────────────────────────────
 DISQUALIFICATION CLASS
-──────────────────────────────────────────────────────────
-
-Assign exactly one disqualification class per sheet:
 
   CRITICAL
-    If blocked_by ∈ { GATE_1, GATE_3, GATE_4 }
-    These sheets can NEVER be final main sheet — no override possible.
+    If blocked_by ∈ {GATE_1, GATE_3, GATE_4, GATE_5}
 
   TECHNICAL
-    If blocked_by = GATE_2 only
-    AND the sheet shows strong REPORTING_FS evidence.
-    Example: canonical report sheet missing company columns.
-    Layer 6 may override this block when other semantic conditions hold.
+    If blocked_by = GATE_2 only and reporting evidence is strong
 
   NONE
-    If layer4.passed = true (no gate fired)
+    If passed = true
 
-──────────────────────────────────────────────────────────
 BUSINESS ARBITRATION RULES
-──────────────────────────────────────────────────────────
 
 BA1 — Technical winner
-  The highest-confidence passing sheet from Layer 5 is the technical winner.
+  Highest-confidence passing sheet from Layer 5.
 
-BA2 — Business winner candidate
-  Search all visible sheets for the strongest REPORTING_FS candidate.
+BA2 — Presentation candidate
+  Strongest safe REPORTING_FS candidate visible to the user,
+  chosen only from real workbook tab names.
 
-BA3 — Safe override condition
-  Override the technical winner with the business winner ONLY if ALL
-  of the following are true:
-
-    1. technical_winner.sheet_type is "ADJUSTMENT_STAGING"
-       OR "INTERMEDIATE_CONSOLIDATION"
-
-    2. business_candidate.sheet_type = "REPORTING_FS"
-
-    3. business_candidate.disqualification_class = "TECHNICAL"
-       OR business_candidate.disqualification_class = "NONE"
-
-    4. business_candidate is NOT blocked by GATE_1, GATE_3, or GATE_4
-
-    5. business_candidate shows FINAL_OUTPUT_ROLE_SIGNAL = 1
-       (is clearly the human-facing FS output)
+BA3 — Safe override
+  Override only if ALL are true:
+    • technical winner is not the clearest human-facing final report
+    • presentation candidate is REPORTING_FS
+    • presentation candidate is not critically blocked
+    • presentation candidate shows FINAL_OUTPUT_ROLE_SIGNAL = 1
 
 BA4 — No unsafe override
-  Never override to a sheet that is:
+  Never override to:
     • SOURCE_TB
-    • hidden (GATE_1)
-    • trial balance (GATE_3)
-    • pure incoming-only source (GATE_4)
+    • ADJUSTMENT_STAGING
+    • hidden sheets
+    • pure incoming-only sources
+    • nonexistent sheet names
+    • semantic umbrella labels
+    • title-derived labels that are not actual tabs
 
 BA5 — Dual truth preservation
-  If BA3 conditions are met (override applies):
-    technical_main_sheet = technical winner    (preserved for traceability)
-    business_main_sheet  = reporting candidate
-    final_main_sheet     = business_main_sheet
-    decision_mode        = "business_override"
+  Preserve both:
+    • technical_main_sheet
+    • presentation_main_sheet
+  final_main_sheet may equal either one depending on override.
 
-  Otherwise (no override):
-    technical_main_sheet = technical winner
-    business_main_sheet  = technical winner
-    final_main_sheet     = technical winner
-    decision_mode        = "technical_default"
-
-──────────────────────────────────────────────────────────
-LAYER 6 OUTPUT
-──────────────────────────────────────────────────────────
-
+BA6 — Sheet-name fidelity
+  technical_main_sheet, presentation_main_sheet, business_main_sheet,
+  and final_main_sheet must all be exact workbook tab names.
+  If a candidate is not an exact workbook tab name, it is invalid and must
+  be discarded.
+  
+Layer 6 output:
   {
-    "technical_main_sheet":  "<sheet>" | null,
-    "business_main_sheet":   "<sheet>" | null,
-    "final_main_sheet":      "<sheet>" | null,
-    "decision_mode":         "technical_default" | "business_override" | "no_valid_sheet",
-    "sheet_types": {
-      "<sheet>": "REPORTING_FS|ADJUSTMENT_STAGING|SOURCE_TB|INTERMEDIATE_CONSOLIDATION|AUXILIARY_SCHEDULE|UNKNOWN"
-    },
-    "disqualification_classes": {
-      "<sheet>": "CRITICAL|TECHNICAL|NONE"
-    },
-    "business_arbitration": {
-      "technical_winner_sheet_type": "...",
-      "business_candidate": "<sheet>" | null,
-      "business_candidate_sheet_type": "...",
-      "business_candidate_blocked_by": "<gate>" | null,
-      "business_candidate_disqualification_class": "CRITICAL|TECHNICAL|NONE|null",
-      "override_applied": true/false
+    "technical_main_sheet": "<sheet>" | null,
+    "presentation_main_sheet": "<sheet>" | null,
+    "business_main_sheet": "<sheet>" | null,
+    "final_main_sheet": "<sheet>" | null,
+    "decision_mode": "technical_default" | "business_override" | "no_valid_sheet"
+  }
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LAYER 7 — TB / card-sheet validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+NN_LAYER_7 = """
+╔══════════════════════════════════════════════════════════╗
+║  LAYER 7 — TB / Card-Sheet Validation                   ║
+╚══════════════════════════════════════════════════════════╝
+
+Purpose:
+  Identify the TB/card sheet that structurally feeds the main reporting sheet.
+  The TB/card sheet and every main-to-TB path node must be exact workbook tab names.
+    Synthetic bridge labels or inferred semantic nodes are forbidden.
+
+TB business definition:
+  A TB sheet contains the card/account details whose summed values — including
+  arithmetic operations and optional AJE adjustments — feed the COA balances
+  shown in the reporting sheet.
+
+A valid TB candidate should strongly satisfy:
+  • HAS_CODE_COLUMN = 1
+  • HAS_DESCRIPTION_COLUMN = 1
+  • HAS_FINAL_COLUMN = 1
+
+Strong reinforcing evidence:
+  • FINAL_REFERENCE_SIGNAL = 1
+  • TB_REFERENCE_SIGNAL = 1
+  • REFERENCED_BY_SIGNAL = 1
+  • appears at the end of a valid main → intermediate/staging → TB chain
+  • numeric amount behaviour is consistent with balance pull-up
+
+TB selection rules:
+
+TB1 — Structural priority
+  Prefer STRONG_TB_PATTERN over plain TB_PATTERN.
+
+TB2 — Graph priority
+  Every candidate path must contain only real workbook tab names.
+  If a path includes a nonexistent or invented node, that path is invalid.
+  Prefer a TB candidate reachable from the final main sheet by:
+    • direct path: main → TB
+    • indirect path: main → intermediate → TB
+    • indirect path: main → staging → TB
+
+TB3 — Code-column quality
+  If several code-like columns exist, prefer the one with:
+    • fewest repetitions
+    • highest unique-to-total ratio
+    • strongest adjacency to description column
+    • strongest code-like formatting (alphanumeric, no spaces)
+
+TB4 — Description-column quality
+  If several description candidates exist, prefer the one with:
+    • fewer repetitions
+    • proximity to code column
+    • account-description behaviour rather than generic labels
+
+TB5 — FINAL-column quality
+  Prefer the amount column that is:
+    • referenced by upstream formulas
+    • or acts as the principal ending-balance numeric column
+  Header text helps but is not required.
+  If there is no formula but the column is the dominant ending-balance numeric
+  column, treat it as FINAL.
+
+TB6 — AJE interpretation
+  AJE may exist as:
+    • one AJE column
+    • two AJE columns: CREDIT and DEBIT
+  If no AJE exists, treat AJE = 0.
+  If only FINAL exists, FINAL remains the effective total amount source.
+
+TB7 — Hidden restriction
+  Hidden sheets should not be selected as the TB/card output unless no visible
+  evidence-backed TB exists and manual review is required.
+
+Layer 7 output:
+  {
+    "is_card_sheet": "<tb_sheet_name>" | null,
+    "technical_tb_sheet": "<tb_sheet_name>" | null,
+    "relationship": {
+      "main_to_tb_path": ["<main>", "...", "<tb>"],
+      "path_valid": true/false
     }
   }
 """
@@ -532,75 +667,96 @@ LAYER 6 OUTPUT
 
 NN_DECISION_PROTOCOL = """
 ╔══════════════════════════════════════════════════════════╗
-║  DECISION PROTOCOL — Full 6-Layer Execution             ║
+║  DECISION PROTOCOL — Full 7-Layer Execution             ║
 ╚══════════════════════════════════════════════════════════╝
 
-Execute these steps in strict order for every sheet in the workbook:
+Execute these steps in strict order for every workbook:
 
-  Step 1 — L0: Extract F0–F7 for every sheet (OCR, no interpretation).
-  Step 2 — L1: Compute all 9 binary signals per sheet.
-  Step 3 — L2: Compute FS_PATTERN, TB_PATTERN, PARTIAL_FS_PATTERN per sheet.
-  Step 4 — L3: Build the cross-sheet dependency graph.
-               Assign role_in_graph to every sheet.
-               Detect CONSOLIDATE (A4) and intermediate sheets (A3).
-  Step 5 — L4: Apply GATE_1 through GATE_4.
-               Any triggered gate → permanent technical disqualification.
-               Record blocked_by for each disqualified sheet.
-  Step 6 — L5: Compute S(sheet) and softmax confidence for passing sheets.
-               Identify the TECHNICAL winner.
-  Step 7 — L6: Run business arbitration.
-               Classify every sheet into a sheet_type.
-               Classify every blocked sheet into a disqualification_class.
-               If the technical winner is ADJUSTMENT_STAGING or
-               INTERMEDIATE_CONSOLIDATION, search for a REPORTING_FS
-               candidate blocked only by a TECHNICAL gate.
-               If safe override conditions (BA3) hold → apply override.
-  Step 8 — Decision: emit final_main_sheet, technical_main_sheet,
-               business_main_sheet, decision_mode.
+  Step 1 — L0:
+    Extract raw workbook features for every sheet.
+    Build the canonical workbook sheet-name universe.
+    Only exact names from this set may appear in any later output.
 
-Output contract:
+  Step 2 — L1:
+    Compute all binary structural signals.
+
+  Step 3 — L2:
+    Compute FS_PATTERN, PARTIAL_FS_PATTERN, TB_PATTERN,
+    STRONG_TB_PATTERN, and STAGING_PATTERN.
+
+  Step 4 — L3:
+    Build dependency graph.
+    Assign graph roles.
+    Detect main → intermediate/staging → TB chains.
+    Record path_to_tb and path_valid.
+    Detect functional FINAL-column evidence.
+    
+  Step 4b — Sheet-name validation:
+    Remove any candidate, evidence key, graph node, or path node that is not
+    an exact workbook tab name.
+    
+  Step 5 — L4:
+    Apply hard gates for MAIN-sheet candidacy only.
+
+  Step 6 — L5:
+    Compute technical main-sheet confidence using TRUE SOFTMAX.
+    Identify technical main-sheet winner.
+
+  Step 7 — L6:
+    Perform business arbitration for the final main reporting sheet.
+    Preserve technical_main_sheet and presentation_main_sheet.
+
+  Step 8 — L7:
+    Select the strongest TB/card sheet using structural and graph validation.
+    Do not rely on sheet name alone.
+    Do not rely on highlighted titles alone.
+
+  Step 9 — Final output:
+    Emit final main sheet, TB sheet, and validated relationship using only
+    exact workbook tab names.
+    If no exact workbook tab name supports a proposed candidate, emit null
+    instead of inventing a name.
+
+Final output contract (must match exactly):
   {
-    "technical_main_sheet":    "<sheet>" | null,
-    "presentation_main_sheet": "<sheet>" | null,
-    "business_main_sheet":     "<sheet>" | null,
-    "final_main_sheet":        "<sheet>" | null,
-    "decision_mode":           "technical_default" | "business_override" | "no_valid_sheet",
-    "sheet_types": {
-      "<sheet>": "REPORTING_FS|ADJUSTMENT_STAGING|SOURCE_TB|INTERMEDIATE_CONSOLIDATION|AUXILIARY_SCHEDULE|UNKNOWN"
-    },
-    "disqualification_classes": {
-      "<sheet>": "CRITICAL|TECHNICAL|NONE"
-    },
-    "business_arbitration": {
-      "technical_winner_sheet_type": "...",
-      "presentation_candidate": "<sheet>" | null,
-      "presentation_candidate_sheet_type": "...",
-      "presentation_candidate_blocked_by": "<gate>" | null,
-      "presentation_candidate_disqualification_class": "CRITICAL|TECHNICAL|NONE|null",
-      "override_applied": true/false
+    "main_sheet_exists": true/false,
+    "main_sheet_name": "<exact workbook tab name>" | null,
+    "is_card_sheet": "<exact workbook tb tab name>" | null,
+    "technical_main_sheet": "<exact workbook tab name>" | null,
+    "presentation_main_sheet": "<exact workbook tab name>" | null,
+    "technical_tb_sheet": "<exact workbook tab name>" | null,
+    "decision_mode": "technical_default" | "business_override" | "business_override_with_tb_validation" | "no_valid_sheet",
+    "relationship": {
+      "main_to_tb_path": ["<exact workbook tab>", "...", "<exact workbook tb tab>"],
+      "path_valid": true/false
     }
   }
 
-Detector override rule:
-  The heuristic detector result is a CANDIDATE HINT only.
-  It must pass all NN layers independently.
-  If the detector's candidate fails any gate → it is blocked,
-  and the NN winner is returned instead.
-  Never return the detector result without NN validation.
+Detector rule:
+  The detector result is a hint only.
+  It must pass structural validation independently.
+  Never return detector output without NN validation.
+  Sheet-name rule:
+  Even if a detector, title, or business interpretation suggests a compelling
+  reporting label, never return it unless it exactly matches a real workbook
+  tab name discovered in Layer 0.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  FULL PROMAT BLOCK  (imported by all agent files)
+#  FULL PROMAT BLOCK
 # ──────────────────────────────────────────────────────────────────────────────
 
 FULL_NN_PROMAT = f"""
 {'═' * 62}
-  NEURAL PROMAT SYSTEM  v3.0
-  6-layer neural architecture with business arbitration.
-  No weights.  No bonuses.  No penalties.
-  Binary signals → pattern logic → graph → firewalls →
-  softmax → business arbitration.
+  NEURAL PROMAT SYSTEM  v6.0
+  Deterministic multi-layer architecture for:
+    • main reporting sheet detection
+    • business/presentation arbitration
+    • TB/card-sheet validation
+  Structure first. Names are hints only.
 {'═' * 62}
+
+{NN_SHEET_NAME_FIDELITY}
 
 {NN_LAYER_0}
 
@@ -615,6 +771,8 @@ FULL_NN_PROMAT = f"""
 {NN_LAYER_5}
 
 {NN_LAYER_6}
+
+{NN_LAYER_7}
 
 {NN_DECISION_PROTOCOL}
 """

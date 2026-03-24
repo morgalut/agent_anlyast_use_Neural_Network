@@ -1,5 +1,5 @@
 {
-  "AE": {
+  "FS": { 
     "is_main_sheet": true,
     "is_card_sheet": true,
     "is_aje_card_sheet": false,
@@ -21,7 +21,7 @@
         "currency": "USD"
       },
       {
-          "is_tb": false,
+        "is_tb": false,
         "column_type": "AE #",
         "is_final": false,
         "is_account_number": false,
@@ -35,7 +35,7 @@
         "currency": "USD"
       },
       {
-             "is_tb": false,
+        "is_tb": false,
         "column_type": "AE #",
         "is_final": false,
         "is_account_number": false,
@@ -63,7 +63,7 @@
         "currency": "USD"
       },
       {
-          "is_tb": false,
+        "is_tb": false,
         "column_type": "AE #",
         "is_final": false,
         "is_account_number": false,
@@ -91,7 +91,7 @@
         "currency": "USD"
       },
       {
-         "is_tb": false,
+        "is_tb": false,
         "column_type": "AE #",
         "is_final": false,
         "is_account_number": false,
@@ -119,7 +119,7 @@
         "currency": "USD"
       },
       {
-         "is_tb": false,
+        "is_tb": false,
         "column_type": "AE #",
         "is_final": false,
         "is_account_number": false,

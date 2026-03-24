@@ -1,0 +1,15 @@
+{
+  "run_id": "97798393-24ea-418a-b71c-13c270224551",
+  "status": "error",
+  "timestamp": "2026-03-24T12:46:52.594588Z",
+  "input": {
+    "file_name": "Assembly - 5.xlsx"
+  },
+  "errors": [
+    {
+      "type": "TypeError",
+      "message": "_clean_sheet_name() takes 1 positional argument but 2 were given",
+      "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\multi_agent\\app\\router\\run.py\", line 182, in run_task\n    result = _run_graph_for_file(temp_path)\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\multi_agent\\app\\router\\run.py\", line 60, in _run_graph_for_file\n    return graph.invoke({\"user_input\": file_path})\n           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\env\\Lib\\site-packages\\langgraph\\pregel\\main.py\", line 3292, in invoke\n    for chunk in self.stream(\n                 ~~~~~~~~~~~^\n        input,\n        ^^^^^^\n    ...<10 lines>...\n        **kwargs,\n        ^^^^^^^^^\n    ):\n    ^\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\env\\Lib\\site-packages\\langgraph\\pregel\\main.py\", line 2725, in stream\n    for _ in runner.tick(\n             ~~~~~~~~~~~^\n        [t for t in loop.tasks.values() if not t.writes],\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<2 lines>...\n        schedule_task=loop.accept_push,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ):\n    ^\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\env\\Lib\\site-packages\\langgraph\\pregel\\_runner.py\", line 167, in tick\n    run_with_retry(\n    ~~~~~~~~~~~~~~^\n        t,\n        ^^\n    ...<10 lines>...\n        },\n        ^^\n    )\n    ^\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\env\\Lib\\site-packages\\langgraph\\pregel\\_retry.py\", line 96, in run_with_retry\n    return task.proc.invoke(task.input, config)\n           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\env\\Lib\\site-packages\\langgraph\\_internal\\_runnable.py\", line 656, in invoke\n    input = context.run(step.invoke, input, config, **kwargs)\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\env\\Lib\\site-packages\\langgraph\\_internal\\_runnable.py\", line 400, in invoke\n    ret = self.func(*args, **kwargs)\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\multi_agent\\app\\server\\orc\\graph.py\", line 2049, in synthesize_node\n    evidence_index = _build_sheet_evidence_index(state)\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\multi_agent\\app\\server\\orc\\graph.py\", line 665, in _build_sheet_evidence_index\n    task_map = _derive_sheet_evidence_from_single_task(parsed, state)\n  File \"C:\\Users\\morga\\Desktop\\xlsx\\multi_agent\\app\\server\\orc\\graph.py\", line 597, in _derive_sheet_evidence_from_single_task\n    main_sheet = _clean_sheet_name(state,parsed.get(\"main_sheet_name\"))\nTypeError: _clean_sheet_name() takes 1 positional argument but 2 were given\nDuring task with name 'synthesize' and id 'fb7c2604-2b61-463d-5be0-0df3a6c43a54'\n"
+    }
+  ]
+}
