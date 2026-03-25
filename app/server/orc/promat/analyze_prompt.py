@@ -36,7 +36,9 @@ For every sheet listed in the workbook summary below:
                     true-softmax-style reasoning.
   7. Run Layer 6  — identify likely presentation/business main-sheet candidate.
   8. Run Layer 7  — identify likely TB/card-sheet candidate and main→TB relationship.
-  9. Produce structured evidence and focused next research steps.
+  9. Detect whether the workbook has one real header sheet or multiple real
+     header sheets such as `BS` and `P&L`.
+  10. Produce structured evidence and focused next research steps.
 
 IMPORTANT ANALYZE-NODE LIMITATIONS
 ──────────────────────────────────
@@ -48,7 +50,34 @@ IMPORTANT ANALYZE-NODE LIMITATIONS
     1. identify strong candidate sheets,
     2. identify likely blocked sheets,
     3. identify likely TB candidates,
-    4. propose what the Research node must verify directly with tools.
+    4. identify likely real reporting header sheets,
+    5. propose what the Research node must verify directly with tools.
+
+CRITICAL SHEET-IDENTITY RULES
+─────────────────────────────
+• A semantic reporting role is NOT the same thing as a worksheet identity.
+• Every returned sheet-bearing field must be an EXACT workbook tab name from the workbook summary.
+• Never invent aliases, umbrella labels, semantic names, normalized names, or title-based replacements.
+• Titles and captions may help classify a sheet's ROLE, but they may NEVER replace the true sheet tab name.
+• If the workbook title says "Statement of Operations" but the real tab is `P&L`, return `P&L`.
+• If the workbook has multiple real reporting tabs such as `BS` and `P&L`, preserve those exact names.
+• Never invent synthetic parent nodes such as:
+    "External Reporting Scheme"
+    "Final Reporting Layer"
+    "Financial Statement Output"
+  unless that exact text is a real workbook tab name.
+• Every element of any inferred path must also be an exact workbook tab name.
+
+MULTI-HEADER ANALYSIS RULE
+──────────────────────────
+• Some workbooks have a single real header sheet, for example `FS`.
+• Some workbooks have multiple real header sheets, for example `BS` and `P&L`.
+• In those cases, do not collapse multiple real reporting tabs into one invented parent concept.
+• At Analyze stage, preserve the strongest real reporting tabs as real candidates.
+• If summary evidence suggests that `BS` and `P&L` are both real business-facing reporting headers,
+  treat both as header-sheet candidates for Research verification.
+• A sheet may still be structurally mixed or ambiguous at summary level; do not erase it as a
+  header-sheet candidate just because it may later need deeper graph verification.
 
 ADDITIONAL RULES
 ────────────────
@@ -73,17 +102,30 @@ Workbook summary:
 Detector hint (non-authoritative starting hint):
 {main_sheet_result}
 
+OUTPUT DISCIPLINE
+─────────────────
+• strongest_candidate must be an exact workbook tab name or null.
+• presentation_candidate must be an exact workbook tab name or null.
+• tb_candidate must be an exact workbook tab name or null.
+• header_sheets must contain only exact workbook tab names.
+• Every key under nn_layers must refer only to exact workbook tab names.
+• Every node in relationship.main_to_tb_path must be an exact workbook tab name.
+• If you cannot map a reporting concept to an exact workbook tab, use null.
+• Do not output a business description in place of a sheet name.
+• Do not output invented umbrella reporting names.
+
 REQUIRED OUTPUT — Return a single JSON object, no markdown:
 {{
   "main_sheet_exists": true/false,
-  "strongest_candidate": "<sheet name or null>",
-  "presentation_candidate": "<sheet name or null>",
-  "tb_candidate": "<sheet name or null>",
+  "strongest_candidate": "<exact workbook tab name or null>",
+  "presentation_candidate": "<exact workbook tab name or null>",
+  "tb_candidate": "<exact workbook tab name or null>",
+  "header_sheets": ["<exact workbook tab name>", "..."],
   "confidence": 0.0,
   "reasoning": "<one concise English sentence>",
   "nn_layers": {{
     "layer1_signals": {{
-      "<sheet>": {{
+      "<exact workbook tab name>": {{
         "COA_SIGNAL": 0,
         "FORMULA_SIGNAL": 0,
         "CROSS_REF_SIGNAL": 0,
@@ -101,7 +143,7 @@ REQUIRED OUTPUT — Return a single JSON object, no markdown:
       }}
     }},
     "layer2_patterns": {{
-      "<sheet>": {{
+      "<exact workbook tab name>": {{
         "FS_PATTERN": 0,
         "TB_PATTERN": 0,
         "PARTIAL_FS_PATTERN": 0,
@@ -110,7 +152,7 @@ REQUIRED OUTPUT — Return a single JSON object, no markdown:
       }}
     }},
     "layer3_graph": {{
-      "<sheet>": {{
+      "<exact workbook tab name>": {{
         "outgoing_refs": [],
         "incoming_refs": [],
         "role_in_graph": "FS|TB|INTERMEDIATE|STAGING|UNKNOWN",
@@ -122,22 +164,22 @@ REQUIRED OUTPUT — Return a single JSON object, no markdown:
       }}
     }},
     "layer4_gates": {{
-      "<sheet>": {{
+      "<exact workbook tab name>": {{
         "passed": true,
         "blocked_by": "GATE_1|GATE_2|GATE_3|GATE_4|GATE_5|null"
       }}
     }},
     "layer5_confidence": {{
-      "<sheet>": 0.0
+      "<exact workbook tab name>": 0.0
     }},
     "layer6_candidates": {{
-      "technical_main_sheet": "<sheet or null>",
-      "presentation_main_sheet": "<sheet or null>"
+      "technical_main_sheet": "<exact workbook tab name or null>",
+      "presentation_main_sheet": "<exact workbook tab name or null>"
     }},
     "layer7_tb": {{
-      "technical_tb_sheet": "<sheet or null>",
+      "technical_tb_sheet": "<exact workbook tab name or null>",
       "relationship": {{
-        "main_to_tb_path": [],
+        "main_to_tb_path": ["<exact workbook tab name>", "...", "<exact workbook tab name>"],
         "path_valid": false
       }}
     }}

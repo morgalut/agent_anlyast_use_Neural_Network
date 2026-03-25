@@ -1,3 +1,5 @@
+
+#multi_agent\app\server\orc\graph.py:
 from __future__ import annotations
 
 import json
@@ -272,6 +274,161 @@ def _sanitize_sheet_name_list(state, values: Any) -> list[str]:
 
     return out
 
+def _sheet_title_text(state, sheet_name: str | None) -> str:
+    if not sheet_name:
+        return ""
+    msr = state.get("main_sheet_result", {}) or {}
+    for bucket in ("output_candidates", "source_candidates", "profiles"):
+        for item in msr.get(bucket, []) or []:
+            if (item.get("sheet") or item.get("sheet_name")) == sheet_name:
+                return str(item.get("title") or "")
+    return ""
+
+
+def _statement_family_signal(sheet_name: str | None, title: str = "") -> dict[str, bool]:
+    name_l = _norm_text(sheet_name)
+    title_l = _norm_text(title)
+    combined = f"{name_l} || {title_l}"
+
+    bs_kws = [
+        "bs",
+        "balance sheet",
+        "statement of financial position",
+        "bbs",
+    ]
+    pl_kws = [
+        "p&l",
+        "pl",
+        "profit and loss",
+        "statement of operations",
+        "statement of income",
+        "income statement",
+    ]
+    cf_kws = [
+        "cf",
+        "cash flow",
+        "cash flows",
+        "statement of cash flows",
+    ]
+    fs_kws = [
+        "fs",
+        "financial statements",
+        "financial statement",
+    ]
+
+    return {
+        "is_bs": _contains_any(combined, bs_kws),
+        "is_pl": _contains_any(combined, pl_kws),
+        "is_cf": _contains_any(combined, cf_kws),
+        "is_fs": _contains_any(combined, fs_kws),
+        "is_statement_family": (
+            _contains_any(combined, bs_kws)
+            or _contains_any(combined, pl_kws)
+            or _contains_any(combined, cf_kws)
+            or _contains_any(combined, fs_kws)
+        ),
+    }
+
+
+def _header_family_rank(sheet: str, ev: dict, title: str) -> tuple:
+    sig = _statement_family_signal(sheet, title)
+    explicit = 1 if ev.get("evidence_status") == "explicit" else 0
+    visible = 1 if ev.get("HIDDEN_SIGNAL", 0) == 0 else 0
+    not_staging = 1 if (
+        ev.get("STAGING_PATTERN", 0) == 0
+        and ev.get("aje_source_role", False) is False
+        and ev.get("role_in_graph") != "STAGING"
+    ) else 0
+
+    # Important:
+    # We do NOT require TB_PATTERN=0 here, because BS/P&L can be misclassified
+    # as mixed source/report tabs but still be real header sheets.
+    statement_family = 1 if sig["is_statement_family"] else 0
+    fs_pattern = 1 if ev.get("FS_PATTERN", 0) == 1 else 0
+    partial_fs = 1 if ev.get("PARTIAL_FS_PATTERN", 0) == 1 else 0
+    coa = 1 if ev.get("COA_SIGNAL", 0) == 1 else 0
+    cross = 1 if ev.get("CROSS_REF_SIGNAL", 0) == 1 else 0
+    company = 1 if ev.get("COMPANY_COLUMN_SIGNAL", 0) == 1 else 0
+    consolidate = 1 if ev.get("CONSOLIDATE_SIGNAL", 0) == 1 or ev.get("consolidate", False) else 0
+    path_valid = 1 if ev.get("path_valid", False) else 0
+    conf = float(ev.get("confidence", 0.0) or 0.0)
+
+    # Prefer BS and P&L strongly for multi-header reporting cases.
+    bs_boost = 1 if sig["is_bs"] else 0
+    pl_boost = 1 if sig["is_pl"] else 0
+    fs_boost = 1 if sig["is_fs"] else 0
+    cf_boost = 1 if sig["is_cf"] else 0
+
+    return (
+        explicit,
+        visible,
+        not_staging,
+        statement_family,
+        bs_boost,
+        pl_boost,
+        fs_boost,
+        cf_boost,
+        fs_pattern,
+        partial_fs,
+        coa,
+        cross,
+        company,
+        consolidate,
+        path_valid,
+        conf,
+    )
+
+
+def _pick_header_sheet_family(
+    state,
+    preferred_sheet: str | None = None,
+    max_count: int = 4,
+) -> list[str]:
+    """
+    Pick the real workbook header/report tabs.
+
+    This is intentionally broader than technical-main selection.
+    It preserves real statement-family tabs such as BS / P&L / CF / FS
+    even when one of them was structurally misclassified as TB-like or intermediate.
+    """
+    ranked: list[tuple[str, tuple]] = []
+
+    for sheet in _candidate_sheet_names(state):
+        if not _is_real_sheet_name(state, sheet):
+            continue
+
+        ev = _extract_nn_evidence(state, sheet)
+        title = _sheet_title_text(state, sheet)
+        sig = _statement_family_signal(sheet, title)
+
+        if ev.get("evidence_status") != "explicit":
+            continue
+        if ev.get("HIDDEN_SIGNAL", 0) == 1:
+            continue
+        if ev.get("STAGING_PATTERN", 0) == 1:
+            continue
+        if ev.get("aje_source_role", False) is True:
+            continue
+        if ev.get("role_in_graph") == "STAGING":
+            continue
+        if not sig["is_statement_family"] and ev.get("FS_PATTERN", 0) != 1 and ev.get("PARTIAL_FS_PATTERN", 0) != 1:
+            continue
+
+        ranked.append((sheet, _header_family_rank(sheet, ev, title)))
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    out: list[str] = []
+
+    if preferred_sheet and preferred_sheet in [s for s, _ in ranked]:
+        out.append(preferred_sheet)
+
+    for sheet, _ in ranked:
+        if sheet not in out:
+            out.append(sheet)
+        if len(out) >= max_count:
+            break
+
+    return out[:max_count]
 
 def _sanitize_research_agent_payload(parsed: dict, state) -> tuple[dict, list[str]]:
     """
@@ -1010,23 +1167,23 @@ def _build_candidate_registry(state) -> dict[str, dict]:
         for sheet in _candidate_names_from_parsed_result(parsed,state):
             ensure_row(sheet)
 
-        v = _clean_sheet_name(parsed.get("main_sheet_name"))
+        v = _sanitize_sheet_name(state, parsed.get("main_sheet_name"))
         if v:
             ensure_row(v)["seen_as_main_sheet"] = True
 
-        v = _clean_sheet_name(parsed.get("technical_main_sheet"))
+        v = _sanitize_sheet_name(state, parsed.get("technical_main_sheet"))
         if v:
             ensure_row(v)["seen_as_technical_main_sheet"] = True
 
-        v = _clean_sheet_name(parsed.get("business_main_sheet"))
+        v = _sanitize_sheet_name(state, parsed.get("business_main_sheet"))
         if v:
             ensure_row(v)["seen_as_business_main_sheet"] = True
 
-        v = _clean_sheet_name(parsed.get("runner_up"))
+        v = _sanitize_sheet_name(state, parsed.get("runner_up"))
         if v:
             ensure_row(v)["seen_as_runner_up"] = True
 
-        v = _clean_sheet_name(parsed.get("main_source_sheet_name"))
+        v = _sanitize_sheet_name(state, parsed.get("main_source_sheet_name"))
         if v:
             row = ensure_row(v)
             row["seen_as_main_source_sheet"] = True
@@ -1064,8 +1221,8 @@ def _build_candidate_registry(state) -> dict[str, dict]:
                 ):
                     _apply_sheet_payload(ensure_row(sheet_name), payload, state)
 
-        # older single-winner nn_evidence fallback
-        main_sheet = _clean_sheet_name(parsed.get("main_sheet_name"))
+        # add state single-winner nn_evidence fallback
+        main_sheet = _sanitize_sheet_name(state, parsed.get("main_sheet_name"))
         nn = parsed.get("nn_evidence", {}) or {}
         if main_sheet and nn and (
             "layer1" in nn or "layer2" in nn or "layer3" in nn or "layer4" in nn
@@ -1341,6 +1498,16 @@ def _candidate_sheet_names(state) -> list[str]:
 
 
 def _pick_promat_fallback_candidate(state) -> tuple[str | None, dict]:
+    """
+    Fallback must prefer real statement/header tabs over generic summaries.
+    This is critical for cases like Assembly 5 where BS and P&L are the real
+    header sheets and a synthetic umbrella concept must not replace them.
+    """
+    header_family = _pick_header_sheet_family(state, max_count=4)
+    if header_family:
+        best_sheet = header_family[0]
+        return best_sheet, _extract_nn_evidence(state, best_sheet)
+
     candidates = _candidate_sheet_names(state)
     if not candidates:
         return None, {}
@@ -1352,7 +1519,6 @@ def _pick_promat_fallback_candidate(state) -> tuple[str | None, dict]:
         ranked.append((sheet, _presentation_rank(sheet, ev, title), ev))
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-
     best_sheet, _, best_ev = ranked[0]
     return best_sheet, best_ev
 
@@ -1501,8 +1667,9 @@ def _pick_tb_candidate(state, final_main_sheet: str | None) -> tuple[str | None,
 def _apply_tb_validation(parsed: dict, state) -> dict:
     result = dict(parsed)
 
-    final_main_sheet = _clean_sheet_name(result.get("main_sheet_name"))
+    final_main_sheet = _sanitize_sheet_name(state, result.get("main_sheet_name"))
     tb_sheet, tb_meta = _pick_tb_candidate(state, final_main_sheet)
+    tb_sheet = _sanitize_sheet_name(state, tb_sheet)
 
     relationship = {
         "main_to_tb_path": [],
@@ -1511,7 +1678,7 @@ def _apply_tb_validation(parsed: dict, state) -> dict:
 
     if final_main_sheet:
         main_ev = _extract_nn_evidence(state, final_main_sheet)
-        main_path = list(main_ev.get("path_to_tb", []) or [])
+        main_path = _sanitize_sheet_name_list(state, list(main_ev.get("path_to_tb", []) or []))
 
         if main_path:
             relationship["main_to_tb_path"] = main_path
@@ -1521,7 +1688,6 @@ def _apply_tb_validation(parsed: dict, state) -> dict:
         relationship["main_to_tb_path"] = [final_main_sheet, tb_sheet] if final_main_sheet else [tb_sheet]
         relationship["path_valid"] = False
 
-    # hard coherence check
     if relationship["main_to_tb_path"]:
         if final_main_sheet and relationship["main_to_tb_path"][0] != final_main_sheet:
             relationship["path_valid"] = False
@@ -1546,8 +1712,13 @@ def _apply_tb_validation(parsed: dict, state) -> dict:
 def _apply_business_arbitration(parsed: dict, state) -> dict:
     result = dict(parsed)
 
-    technical_winner = _clean_sheet_name(result.get("main_sheet_name"))
-    strong_main_sheets = _pick_display_main_sheets(state, technical_winner, max_count=2)
+    technical_winner = _sanitize_sheet_name(state, result.get("main_sheet_name"))
+    header_family = _pick_header_sheet_family(state, preferred_sheet=technical_winner, max_count=4)
+
+    if not technical_winner and header_family:
+        technical_winner = header_family[0]
+
+    strong_main_sheets = _pick_display_main_sheets(state, technical_winner, max_count=4) if technical_winner else []
 
     if not technical_winner:
         result.setdefault("technical_main_sheet", None)
@@ -1574,6 +1745,24 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
     tech_conf = float(tech_ev.get("confidence", 0.0) or 0.0)
 
     presentation_candidate, pc_meta = _pick_presentation_candidate(state)
+
+    # If no standard presentation candidate exists, prefer the best real header-family tab.
+    if not presentation_candidate and header_family:
+        presentation_candidate = header_family[0]
+        ev = _extract_nn_evidence(state, presentation_candidate)
+        title = _sheet_title_from_candidates(state, presentation_candidate)
+        pc_type = _classify_sheet_type(presentation_candidate, ev, title)
+        pc_dq = _disqualification_class(ev, pc_type)
+        pc_meta = {
+            "sheet_type": pc_type,
+            "blocked_by": ev.get("blocked_by"),
+            "disqualification_class": pc_dq,
+            "confidence": float(ev.get("confidence", 0.0) or 0.0),
+            "title": title,
+            "evidence_status": ev.get("evidence_status"),
+            "signals": _business_signals(presentation_candidate, ev, title),
+        }
+
     pc_type = pc_meta.get("sheet_type")
     pc_blocked = pc_meta.get("blocked_by")
     pc_dq = pc_meta.get("disqualification_class")
@@ -1583,10 +1772,10 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
 
     if presentation_candidate and presentation_candidate != technical_winner:
         safe_candidate = (
-            pc_dq in ("NONE", "TECHNICAL")
+            _is_real_sheet_name(state, presentation_candidate)
+            and pc_dq in ("NONE", "TECHNICAL")
             and pc_blocked not in ("GATE_1", "GATE_3", "GATE_4")
-            and pc_type == "REPORTING_FS"
-            and pc_signals.get("FINAL_OUTPUT_ROLE_SIGNAL") is True
+            and pc_type in ("REPORTING_FS", "INTERMEDIATE_CONSOLIDATION")
         )
 
         technical_is_less_human_final = tech_type in (
@@ -1595,7 +1784,10 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
         )
 
         presentation_materially_better = (
-            pc_signals.get("CANONICAL_FS_TITLE_SIGNAL") is True
+            (
+                pc_signals.get("CANONICAL_FS_TITLE_SIGNAL") is True
+                or _statement_family_signal(presentation_candidate, pc_meta.get("title", "")).get("is_statement_family", False)
+            )
             and pc_signals.get("PRESENTATION_LAYOUT_SIGNAL") is True
             and tech_conf <= 0.55
         )
@@ -1608,13 +1800,25 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
     presentation_sheet = presentation_candidate if presentation_candidate else technical_winner
     final_sheet = presentation_sheet if override else authoritative_sheet
 
+    final_sheet = _sanitize_sheet_name(state, final_sheet)
+    authoritative_sheet = _sanitize_sheet_name(state, authoritative_sheet)
+    presentation_sheet = _sanitize_sheet_name(state, presentation_sheet)
+
+    if not final_sheet and header_family:
+        final_sheet = header_family[0]
+    if not authoritative_sheet and final_sheet:
+        authoritative_sheet = final_sheet
+    if not presentation_sheet and final_sheet:
+        presentation_sheet = final_sheet
+
+    strong_main_sheets = _pick_display_main_sheets(state, final_sheet, max_count=4) if final_sheet else []
+
     result["technical_main_sheet"] = authoritative_sheet
     result["presentation_main_sheet"] = presentation_sheet
     result["business_main_sheet"] = presentation_sheet
     result["main_sheet_name"] = final_sheet
     result["main_sheet_exists"] = bool(final_sheet)
 
-    # NEW: plural outputs
     result["technical_main_sheets"] = strong_main_sheets
     result["presentation_main_sheets"] = strong_main_sheets
     result["business_main_sheets"] = strong_main_sheets
@@ -1631,7 +1835,7 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
 
     result["business_arbitration"] = {
         "technical_winner_sheet_type": tech_type,
-        "presentation_candidate": presentation_candidate,
+        "presentation_candidate": presentation_candidate if _is_real_sheet_name(state, presentation_candidate) else None,
         "presentation_candidate_sheet_type": pc_type,
         "presentation_candidate_blocked_by": pc_blocked,
         "presentation_candidate_disqualification_class": pc_dq,
@@ -1640,15 +1844,14 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
 
     if override:
         result["reasoning"] = (
-            f"Technical winner '{technical_winner}' remains the authoritative "
-            f"structural FS sheet, but Layer-6 selected '{presentation_candidate}' "
-            f"as the human-facing final report sheet. Strong master sheets: "
-            f"{strong_main_sheets}."
+            f"Technical winner '{technical_winner}' remains the structural winner, "
+            f"but Layer-6 selected '{presentation_candidate}' as the human-facing final report tab. "
+            f"Real header sheets: {strong_main_sheets}."
         )
     else:
         result["reasoning"] = (
             f"Technical winner '{technical_winner}' remained final. "
-            f"Strong master sheets: {strong_main_sheets}."
+            f"Real header sheets: {strong_main_sheets}."
         )
 
     add_step_log(state, "business_arbitration:resolved", {
@@ -1660,6 +1863,7 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
         "override": override,
         "final_sheet": final_sheet,
         "strong_main_sheets": strong_main_sheets,
+        "header_family": header_family,
     })
 
     return result
@@ -1667,7 +1871,15 @@ def _apply_business_arbitration(parsed: dict, state) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Court helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _pick_display_main_sheets(state, final_main_sheet: str | None, max_count: int = 2) -> list[str]:
+def _pick_display_main_sheets(state, final_main_sheet: str | None, max_count: int = 4) -> list[str]:
+    """
+    Return the real workbook header/report tabs to display.
+
+    This is not just the technical path.
+    It is intentionally designed to preserve statement-family tabs such as:
+      FS, BS, P&L, CF
+    when they are real workbook tabs.
+    """
     if not final_main_sheet:
         return []
 
@@ -1676,22 +1888,31 @@ def _pick_display_main_sheets(state, final_main_sheet: str | None, max_count: in
     def _add(sheet: str | None) -> None:
         if not sheet:
             return
+        if not _is_real_sheet_name(state, sheet):
+            return
         if sheet not in result:
             result.append(sheet)
 
     _add(final_main_sheet)
 
+    # First preference: statement-family real tabs across the workbook
+    header_family = _pick_header_sheet_family(
+        state,
+        preferred_sheet=final_main_sheet,
+        max_count=max_count,
+    )
+    for sheet in header_family:
+        _add(sheet)
+        if len(result) >= max_count:
+            return result[:max_count]
+
+    # Second preference: valid real path nodes
     main_ev = _extract_nn_evidence(state, final_main_sheet)
     path = list(main_ev.get("path_to_tb", []) or [])
     path = [p for p in path if _is_real_sheet_name(state, p)]
 
     for sheet in path[1:-1]:
         ev = _extract_nn_evidence(state, sheet)
-        title = _sheet_title_from_candidates(state, sheet)
-        name_l = _norm_text(sheet)
-        title_l = _norm_text(title)
-        combined = f"{name_l} || {title_l}"
-
         if ev.get("evidence_status") != "explicit":
             continue
         if ev.get("HIDDEN_SIGNAL", 0) == 1:
@@ -1702,18 +1923,7 @@ def _pick_display_main_sheets(state, final_main_sheet: str | None, max_count: in
             continue
         if ev.get("role_in_graph") == "STAGING":
             continue
-        if ev.get("role_in_graph") == "TB":
-            continue
-
-        # allow statement-family intermediates like BS / P&L / CF
-        if any(k in combined for k in [
-            "balance sheet", "bs",
-            "profit and loss", "p&l",
-            "cash flow", "cf",
-            "statement of"
-        ]):
-            _add(sheet)
-
+        _add(sheet)
         if len(result) >= max_count:
             break
 
@@ -2063,8 +2273,19 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
         })
 
         def _build_forced_fallback_result(reason: str) -> dict:
-            chosen_name, chosen_ev = _pick_promat_fallback_candidate(state)
-            alt_candidates = []
+            chosen_name: str | None = None
+            chosen_ev: dict = {}
+
+            # Prefer real header-family sheets first (BS, P&L, FS, CF)
+            header_family = _pick_header_sheet_family(state, max_count=4)
+
+            if header_family:
+                chosen_name = header_family[0]
+                chosen_ev = _extract_nn_evidence(state, chosen_name)
+            else:
+                chosen_name, chosen_ev = _pick_promat_fallback_candidate(state)
+
+            alt_candidates: list[tuple[str, dict]] = []
 
             for sheet in _candidate_sheet_names(state):
                 ev = _extract_nn_evidence(state, sheet)
@@ -2081,34 +2302,40 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                 ):
                     alt_candidates.append((sheet, ev))
 
-            chosen_type = _classify_sheet_type(
-                chosen_name,
-                chosen_ev,
-                _sheet_title_from_candidates(state, chosen_name),
-            )
-
-            if chosen_type == "SOURCE_TB" and alt_candidates:
-                alt_candidates.sort(
-                    key=lambda x: float(x[1].get("confidence", 0.0) or 0.0),
-                    reverse=True,
+            if chosen_name:
+                chosen_type = _classify_sheet_type(
+                    chosen_name,
+                    chosen_ev,
+                    _sheet_title_from_candidates(state, chosen_name),
                 )
-                chosen_name, chosen_ev = alt_candidates[0]
+
+                if chosen_type == "SOURCE_TB" and alt_candidates:
+                    alt_candidates.sort(
+                        key=lambda x: float(x[1].get("confidence", 0.0) or 0.0),
+                        reverse=True,
+                    )
+                    chosen_name, chosen_ev = alt_candidates[0]
 
             if not chosen_name:
                 return {
                     "main_sheet_exists": False,
                     "main_sheet_name": None,
+                    "main_sheet_names": [],
                     "is_card_sheet": None,
                     "technical_main_sheet": None,
                     "presentation_main_sheet": None,
                     "technical_tb_sheet": None,
                     "business_main_sheet": None,
+                    "technical_main_sheets": [],
+                    "presentation_main_sheets": [],
+                    "business_main_sheets": [],
                     "decision_mode": "no_valid_sheet",
                     "confidence": 0.0,
                     "reasoning": f"No sheet candidates were available at all. {reason}",
                     "api_response": {
                         "main_sheet_exists": False,
                         "main_sheet_name": None,
+                        "main_sheet_names": [],
                     },
                     "relationship": {
                         "main_to_tb_path": [],
@@ -2134,6 +2361,8 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
             )
             dq = _disqualification_class(chosen_ev, stype)
 
+            strong_main_sheets = _pick_display_main_sheets(state, chosen_name, max_count=4)
+
             fallback_conf = float(chosen_ev.get("confidence", 0.0) or 0.01)
             if fallback_conf <= 0.0:
                 fallback_conf = 0.01
@@ -2145,16 +2374,21 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                 "disqualification_class": dq,
                 "evidence_status": chosen_ev.get("evidence_status"),
                 "confidence": fallback_conf,
+                "strong_main_sheets": strong_main_sheets,
             })
 
             fallback = {
                 "main_sheet_exists": True,
                 "main_sheet_name": chosen_name,
+                "main_sheet_names": strong_main_sheets,
                 "is_card_sheet": None,
                 "technical_main_sheet": chosen_name,
                 "presentation_main_sheet": chosen_name,
                 "technical_tb_sheet": None,
                 "business_main_sheet": chosen_name,
+                "technical_main_sheets": strong_main_sheets,
+                "presentation_main_sheets": strong_main_sheets,
+                "business_main_sheets": strong_main_sheets,
                 "decision_mode": "forced_fallback",
                 "confidence": fallback_conf,
                 "reasoning": (
@@ -2165,6 +2399,7 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                 "api_response": {
                     "main_sheet_exists": True,
                     "main_sheet_name": chosen_name,
+                    "main_sheet_names": strong_main_sheets,
                 },
                 "relationship": {
                     "main_to_tb_path": [],
@@ -2280,7 +2515,11 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                     f"'{technical_name}'."
                 )
 
-                display_main_sheets = _pick_display_main_sheets(state, technical_name, max_count=2)
+                display_main_sheets = _pick_display_main_sheets(
+                    state,
+                    technical_name,
+                    max_count=4,
+                )
                 fallback["main_sheet_names"] = display_main_sheets
                 fallback["technical_main_sheets"] = display_main_sheets
                 fallback["presentation_main_sheets"] = display_main_sheets
@@ -2378,15 +2617,24 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                     _sheet_title_from_candidates(state, forced_name),
                 )
                 dq = _disqualification_class(forced_ev, stype)
+                display_main_sheets = _pick_display_main_sheets(
+                    state,
+                    forced_name,
+                    max_count=4,
+                )
 
                 fallback = {
                     "main_sheet_exists": True,
                     "main_sheet_name": forced_name,
+                    "main_sheet_names": display_main_sheets,
                     "is_card_sheet": None,
                     "technical_main_sheet": forced_name,
                     "presentation_main_sheet": forced_name,
                     "technical_tb_sheet": None,
                     "business_main_sheet": forced_name,
+                    "technical_main_sheets": display_main_sheets,
+                    "presentation_main_sheets": display_main_sheets,
+                    "business_main_sheets": display_main_sheets,
                     "decision_mode": "forced_fallback_after_exception",
                     "confidence": float(forced_ev.get("confidence", 0.0) or 0.01),
                     "reasoning": (
@@ -2398,6 +2646,7 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                     "api_response": {
                         "main_sheet_exists": True,
                         "main_sheet_name": forced_name,
+                        "main_sheet_names": display_main_sheets,
                     },
                     "relationship": {
                         "main_to_tb_path": [],
@@ -2422,6 +2671,7 @@ def synthesize_node(state: OrchestratorState) -> OrchestratorState:
                     **state,
                     "final_answer": raw_content,
                     "main_sheet_name": forced_name,
+                    "main_sheet_names": fallback.get("main_sheet_names", []),
                     "has_main_sheet": True,
                     "is_card_sheet": fallback.get("is_card_sheet"),
                     "technical_main_sheet": fallback.get("technical_main_sheet"),

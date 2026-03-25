@@ -6,11 +6,13 @@ _SYNTHESIS_OUTPUT_SCHEMA = """
 REQUIRED OUTPUT — Return a single JSON object, no markdown:
 {
   "main_sheet_exists": true/false,
-  "main_sheet_name": "<final sheet name or null>",
-  "is_card_sheet": "<TB sheet name or null>",
-  "technical_main_sheet": "<sheet name or null>",
-  "presentation_main_sheet": "<sheet name or null>",
-  "technical_tb_sheet": "<TB sheet name or null>",
+  "main_sheet_name": "<exact workbook tab name or null>",
+  "header_sheets": ["<exact workbook tab name>", "..."],
+  "is_card_sheet": "<exact workbook TB tab name or null>",
+  "technical_main_sheet": "<exact workbook tab name or null>",
+  "presentation_main_sheet": "<exact workbook tab name or null>",
+  "business_main_sheet": "<exact workbook tab name or null>",
+  "technical_tb_sheet": "<exact workbook TB tab name or null>",
   "decision_mode": "technical_default|business_override|business_override_with_tb_validation|no_valid_sheet",
   "confidence": 0.0,
   "reasoning": "<one concise English sentence>",
@@ -19,22 +21,22 @@ REQUIRED OUTPUT — Return a single JSON object, no markdown:
     "all_gates_passed": true/false,
     "layer3_role": "FS|TB|INTERMEDIATE|STAGING|UNKNOWN",
     "inter_agent_signal_agreement": true/false,
-    "softmax_winner": "<sheet name or null>",
-    "softmax_distribution": {"<sheet>": 0.0},
-    "tb_softmax_winner": "<sheet name or null>",
+    "softmax_winner": "<exact workbook tab name or null>",
+    "softmax_distribution": {"<exact workbook tab name>": 0.0},
+    "tb_softmax_winner": "<exact workbook tab name or null>",
     "tb_candidate_confirmed": true/false,
     "path_to_tb_confirmed": true/false
   },
   "business_arbitration": {
     "technical_winner_sheet_type": "REPORTING_FS|ADJUSTMENT_STAGING|SOURCE_TB|INTERMEDIATE_CONSOLIDATION|AUXILIARY_SCHEDULE|UNKNOWN|null",
-    "presentation_candidate": "<sheet name or null>",
+    "presentation_candidate": "<exact workbook tab name or null>",
     "presentation_candidate_sheet_type": "REPORTING_FS|ADJUSTMENT_STAGING|SOURCE_TB|INTERMEDIATE_CONSOLIDATION|AUXILIARY_SCHEDULE|UNKNOWN|null",
     "presentation_candidate_blocked_by": "<gate or null>",
     "presentation_candidate_disqualification_class": "CRITICAL|TECHNICAL|NONE|null",
     "override_applied": true/false
   },
   "relationship": {
-    "main_to_tb_path": [],
+    "main_to_tb_path": ["<exact workbook tab name>", "...", "<exact workbook tab name>"],
     "path_valid": false
   },
   "blocked_sheets": {
@@ -44,11 +46,11 @@ REQUIRED OUTPUT — Return a single JSON object, no markdown:
     "incoming_only": [],
     "staging": []
   },
-  "runner_up": "<sheet name or null>",
+  "runner_up": "<exact workbook tab name or null>",
   "suggested_manual_review": [],
   "api_response": {
     "main_sheet_exists": true/false,
-    "main_sheet_name": "<final sheet name or null>"
+    "main_sheet_name": "<exact workbook tab name or null>"
   }
 }
 """
@@ -82,13 +84,76 @@ authoritative verdict on:
   1. the final main reporting sheet
   2. the technical main sheet
   3. the presentation/business main sheet
-  4. the TB/card sheet
-  5. the validated relationship between main sheet and TB sheet
+  4. the real header-sheet set when reporting is split across multiple tabs
+  5. the TB/card sheet
+  6. the validated relationship between main sheet and TB sheet
 
 You must follow the Neural PROMAT layers exactly.
 You must not invent evidence.
 You must not trust sheet names alone.
 You must not trust highlighted titles alone.
+
+NON-NEGOTIABLE SHEET-IDENTITY RULE
+──────────────────────────────────
+A semantic reporting role is NOT the same thing as a worksheet identity.
+
+You may reason about:
+  • reporting output
+  • business presentation
+  • final FS role
+  • external reporting structure
+  • consolidated reporting layer
+
+But every sheet-bearing field in the final JSON must be an EXACT workbook tab name.
+This applies to:
+  • main_sheet_name
+  • header_sheets
+  • technical_main_sheet
+  • presentation_main_sheet
+  • business_main_sheet
+  • technical_tb_sheet
+  • is_card_sheet
+  • runner_up
+  • nn_synthesis.softmax_winner
+  • nn_synthesis.tb_softmax_winner
+  • all softmax_distribution keys
+  • business_arbitration.presentation_candidate
+  • relationship.main_to_tb_path
+
+Titles, captions, semantic labels, and inferred business entities may help classify a sheet,
+but they may NEVER replace the real workbook tab name.
+
+Examples:
+  • If the visible title says "CONSOLIDATED STATEMENTS OF OPERATIONS" but the tab is `P&L`,
+    you must return `P&L`.
+  • If `BS` and `P&L` are both real reporting tabs, do not invent
+    "External Reporting Scheme" or any similar umbrella node unless that exact
+    text is a real workbook tab name.
+  • If a concept cannot be mapped to an exact workbook tab name, return null.
+
+MULTI-HEADER REPORTING RULE
+───────────────────────────
+Some workbooks have one real final reporting tab, for example:
+  • `FS`
+
+Other workbooks have multiple real visible final header tabs, for example:
+  • `BS`
+  • `P&L`
+  • sometimes also `CF`
+
+When the workbook's real business-facing reporting output is split across multiple
+real worksheet tabs:
+  • preserve those real tabs in `header_sheets`
+  • do not collapse them into an invented parent node
+  • do not replace them with a semantic umbrella label
+  • choose `main_sheet_name` as the strongest single final reporting tab for API compatibility
+  • but preserve the multi-sheet business truth in `header_sheets`
+
+Therefore:
+  • `main_sheet_name` is still singular
+  • `header_sheets` preserves the real visible header-sheet set
+  • if the correct business answer is `BS` and `P&L`, then `header_sheets` must contain both
+  • never convert `BS` + `P&L` into "External Reporting Scheme"
 
 SYNTHESIS RULES
 ───────────────
@@ -99,6 +164,11 @@ SYNTHESIS RULES
   per-sheet evidence as the primary NN aggregation source.
   Do not discard structured evidence merely because the envelope schema
   is imperfect.
+
+[NS0b — Sheet-name fidelity recovery]
+  Recover candidate sheets only from exact workbook tab names present in the evidence universe.
+  If a candidate/evidence key/path node is not an exact workbook tab name, discard it.
+  Never upgrade a semantic label into a candidate sheet.
 
 [NS1 — Cross-agent evidence aggregation]
   For each candidate sheet, collect NN-layer evidence from ALL task_results.
@@ -113,6 +183,20 @@ SYNTHESIS RULES
   Prefer the sheet that behaves as:
     reporting output → intermediate/staging → TB
   over the sheet that behaves as a source or staging layer.
+
+[NS2b — Header-sheet preservation]
+  If real visible statement-family tabs such as `FS`, `BS`, `P&L`, or `CF`
+  are supported by workbook evidence as final business-facing reporting tabs,
+  preserve them in `header_sheets` even if only one of them becomes the single
+  `main_sheet_name`.
+
+  Important:
+    • `header_sheets` may contain one tab or multiple tabs
+    • `header_sheets` must contain only exact workbook tab names
+    • do not exclude `BS` or `P&L` from `header_sheets` only because they also
+      have mixed structural behavior
+    • if a real visible statement-family tab is a genuine business-facing header tab,
+      preserve it as a header tab even if the graph also treats it as intermediate
 
 [NS3 — Hard gate enforcement (NON-NEGOTIABLE)]
   Every proposed TECHNICAL main sheet must have layer4.passed = true.
@@ -153,13 +237,14 @@ SYNTHESIS RULES
   The heuristic detector in main_sheet_result is a hint only.
   If the NN synthesis winner differs from the detector hint, the NN synthesis winner wins.
   Never revert to the detector result merely because its title sounds right.
+  Never return a detector/title/business label unless it exactly matches a workbook tab name.
 
 [NS7 — API contract]
   api_response must contain ONLY:
     • main_sheet_exists
     • main_sheet_name
   main_sheet_name in api_response must equal the final post-L6 / post-L7
-  main reporting sheet.
+  main reporting sheet, using an exact workbook tab name only.
 
 [NS8 — Layer-6 business arbitration]
   After selecting the technical main-sheet winner, apply Layer 6.
@@ -206,18 +291,42 @@ SYNTHESIS RULES
       2. presentation candidate is REPORTING_FS
       3. presentation candidate is not critically blocked
       4. presentation candidate shows clear FINAL_OUTPUT_ROLE_SIGNAL behavior
+      5. presentation candidate is an exact workbook tab name
 
   Step D — If override applies:
     technical_main_sheet = technical winner
     presentation_main_sheet = presentation candidate
+    business_main_sheet = presentation_main_sheet
     main_sheet_name = presentation_main_sheet
     decision_mode = "business_override"
 
   Step E — Otherwise:
     technical_main_sheet = technical winner
     presentation_main_sheet = technical winner or best presentation-safe candidate
+    business_main_sheet = presentation_main_sheet
     main_sheet_name = technical winner
     decision_mode = "technical_default"
+
+  Step F — No synthetic override
+    Never override to:
+      • semantic umbrella labels
+      • title-derived labels that are not real tabs
+      • invented reporting entities
+      • nonexistent sheet names
+
+  Step G — Header-sheet preservation after arbitration
+    After deciding the single `main_sheet_name`, preserve the real reporting
+    header tabs in `header_sheets`.
+
+    If the workbook has:
+      • one real final reporting tab → `header_sheets` may contain one item
+      • multiple real visible final reporting tabs such as `BS` and `P&L` →
+        preserve both in `header_sheets`
+
+    `header_sheets` must:
+      • contain only exact workbook tab names
+      • never contain invented umbrella labels
+      • never replace real tabs with semantic report labels
 
 [NS9 — Layer-7 TB/card-sheet validation]
   After final main-sheet determination, run Layer 7.
@@ -242,9 +351,10 @@ SYNTHESIS RULES
          main → staging → TB
     5. Prefer visible evidence-backed TB sheets
     6. Do not choose TB by sheet name alone
+    7. Every path node must be an exact workbook tab name
 
   relationship.path_valid = true only if the path is structurally supported by
-  Layer-3 graph evidence.
+  Layer-3 graph evidence and every path node is an exact workbook tab name.
 
 [NS10 — Decision-mode upgrade with TB validation]
   If:
@@ -269,6 +379,7 @@ SYNTHESIS RULES
     • final main sheet is valid but TB relationship is weak
     • only hidden TB candidates exist
     • path_to_tb is unresolved
+    • the workbook clearly has multiple real header tabs and the single-winner choice is technically forced by the API contract
 
 LIVE INPUT
 ──────────
@@ -287,19 +398,22 @@ Execution agent results (primary evidence source):
 INSTRUCTIONS
 ────────────
 1. Recover all structured per-sheet NN evidence from task_results.
-2. Aggregate Layer-1 through Layer-4 evidence across agents.
-3. Enforce hard gates exactly.
-4. Compute the technical main-sheet winner using true-softmax-style synthesis.
-5. Apply Layer-6 business arbitration.
-6. Apply Layer-7 TB/card-sheet validation.
-7. Populate:
+2. Discard any candidate/evidence key/path node that is not an exact workbook tab name.
+3. Aggregate Layer-1 through Layer-4 evidence across agents.
+4. Enforce hard gates exactly.
+5. Compute the technical main-sheet winner using true-softmax-style synthesis.
+6. Apply Layer-6 business arbitration.
+7. Preserve the real reporting header-sheet set in `header_sheets`.
+8. Apply Layer-7 TB/card-sheet validation.
+9. Populate:
      • nn_synthesis
      • business_arbitration
      • relationship
      • blocked_sheets
-8. Ensure main_sheet_name is the final authoritative post-arbitration main sheet.
-9. Ensure is_card_sheet is the final TB/card-sheet name or null.
-10. Return JSON only.
+10. Ensure main_sheet_name is the final authoritative post-arbitration main sheet.
+11. Ensure `header_sheets` preserves the real visible reporting header tabs.
+12. Ensure is_card_sheet is the final TB/card-sheet name or null.
+13. Return JSON only.
 
 {_SYNTHESIS_OUTPUT_SCHEMA}
 """.strip()

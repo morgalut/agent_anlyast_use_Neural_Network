@@ -64,6 +64,153 @@ def _parse_json_from_text(text: str) -> dict | None:
     return None
 
 
+def _clean_sheet_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _workbook_sheet_name_set(state) -> set[str]:
+    """
+    Canonical set of real workbook sheet names discovered from workbook summary.
+    Export/report logic must never present non-real names as if they were tabs.
+    """
+    names: set[str] = set()
+
+    excel_summary = state.get("excel_summary", {}) or {}
+    for p in excel_summary.get("profiles", []) or []:
+        sn = p.get("sheet_name")
+        if sn:
+            names.add(str(sn).strip())
+
+    main_sheet_result = state.get("main_sheet_result", {}) or {}
+    for bucket in ("profiles", "output_candidates", "source_candidates"):
+        for item in main_sheet_result.get(bucket, []) or []:
+            sn = item.get("sheet_name") or item.get("sheet")
+            if sn:
+                names.add(str(sn).strip())
+
+    workbook_sheet_names = state.get("workbook_sheet_names") or []
+    for sn in workbook_sheet_names:
+        if sn:
+            names.add(str(sn).strip())
+
+    return {n for n in names if n}
+
+
+def _is_real_sheet_name(state, value: Any) -> bool:
+    name = _clean_sheet_name(value)
+    if not name:
+        return False
+    return name in _workbook_sheet_name_set(state)
+
+
+def _sanitize_sheet_name(state, value: Any) -> str | None:
+    name = _clean_sheet_name(value)
+    if not name:
+        return None
+    return name if _is_real_sheet_name(state, name) else None
+
+
+def _sanitize_sheet_name_list(state, values: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    if not isinstance(values, list):
+        return out
+
+    for v in values:
+        name = _sanitize_sheet_name(state, v)
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+
+    return out
+
+
+def _extract_header_sheets(final_parsed: dict, state) -> list[str]:
+    """
+    Export helper for multi-header FS cases.
+    Prefer explicit plural fields if present, then fall back to real main-sheet lists.
+    """
+    candidates: list[str] = []
+
+    for field in (
+        "header_sheets",
+        "main_sheet_names",
+        "technical_main_sheets",
+        "presentation_main_sheets",
+        "business_main_sheets",
+    ):
+        vals = final_parsed.get(field)
+        if isinstance(vals, list):
+            candidates.extend(vals)
+
+    cleaned = _sanitize_sheet_name_list(state, candidates)
+
+    if cleaned:
+        return cleaned
+
+    singletons = [
+        final_parsed.get("main_sheet_name"),
+        final_parsed.get("technical_main_sheet"),
+        final_parsed.get("presentation_main_sheet"),
+    ]
+    return [x for x in (_sanitize_sheet_name(state, v) for v in singletons) if x]
+
+
+def _invalid_name_warnings(state, final_parsed: dict) -> list[str]:
+    warnings: list[str] = []
+
+    fields = [
+        ("main_sheet_name", final_parsed.get("main_sheet_name")),
+        ("technical_main_sheet", final_parsed.get("technical_main_sheet")),
+        ("presentation_main_sheet", final_parsed.get("presentation_main_sheet")),
+        ("technical_tb_sheet", final_parsed.get("technical_tb_sheet")),
+        ("is_card_sheet", final_parsed.get("is_card_sheet")),
+        ("runner_up", final_parsed.get("runner_up")),
+    ]
+
+    for field, value in fields:
+        cleaned = _clean_sheet_name(value)
+        if cleaned and not _is_real_sheet_name(state, cleaned):
+            warnings.append(
+                f"- `{field}` contains non-workbook sheet name: `{cleaned}`"
+            )
+
+    relationship = final_parsed.get("relationship", {}) or {}
+    path = relationship.get("main_to_tb_path", []) or []
+    bad_nodes = [p for p in path if not _is_real_sheet_name(state, p)]
+    if bad_nodes:
+        warnings.append(
+            f"- `relationship.main_to_tb_path` contains non-workbook nodes: `{', '.join(bad_nodes)}`"
+        )
+
+    nn_synth = final_parsed.get("nn_synthesis", {}) or {}
+    for field in ("softmax_winner", "tb_softmax_winner"):
+        value = _clean_sheet_name(nn_synth.get(field))
+        if value and not _is_real_sheet_name(state, value):
+            warnings.append(f"- `nn_synthesis.{field}` contains non-workbook sheet name: `{value}`")
+
+    softmax_distribution = nn_synth.get("softmax_distribution", {}) or {}
+    if isinstance(softmax_distribution, dict):
+        bad_keys = [k for k in softmax_distribution.keys() if not _is_real_sheet_name(state, k)]
+        if bad_keys:
+            warnings.append(
+                f"- `nn_synthesis.softmax_distribution` contains non-workbook keys: `{', '.join(bad_keys)}`"
+            )
+
+    ba = final_parsed.get("business_arbitration", {}) or {}
+    pc = _clean_sheet_name(ba.get("presentation_candidate"))
+    if pc and not _is_real_sheet_name(state, pc):
+        warnings.append(
+            f"- `business_arbitration.presentation_candidate` contains non-workbook sheet name: `{pc}`"
+        )
+
+    return warnings
+
+
 def _extract_nn_evidence(state, sheet_name: str | None) -> dict:
     """
     Pull NN layer evidence for a specific sheet_name from task_results.
@@ -79,11 +226,9 @@ def _extract_nn_evidence(state, sheet_name: str | None) -> dict:
         if not parsed:
             continue
 
-        # Preferred: per-sheet evidence map
         sheet_evidence = parsed.get("sheet_evidence", {}) or {}
         payload = sheet_evidence.get(sheet_name)
 
-        # Legacy fallback: nn_evidence only for chosen main sheet
         if not payload and parsed.get("main_sheet_name") == sheet_name:
             payload = parsed.get("nn_evidence", {})
 
@@ -96,7 +241,6 @@ def _extract_nn_evidence(state, sheet_name: str | None) -> dict:
         l4 = payload.get("layer4", {}) or {}
 
         return {
-            # Layer 1
             "COA_SIGNAL": int(l1.get("COA_SIGNAL", 0)),
             "FORMULA_SIGNAL": int(l1.get("FORMULA_SIGNAL", 0)),
             "CROSS_REF_SIGNAL": int(l1.get("CROSS_REF_SIGNAL", 0)),
@@ -112,18 +256,15 @@ def _extract_nn_evidence(state, sheet_name: str | None) -> dict:
             "STAGING_ROLE_SIGNAL": int(l1.get("STAGING_ROLE_SIGNAL", 0)),
             "HIDDEN_SIGNAL": int(l1.get("HIDDEN_SIGNAL", 0)),
 
-            # Backward-compatible aliases for display convenience
             "CODE_COLUMN_SIGNAL": int(l1.get("CODE_COLUMN_SIGNAL", l1.get("HAS_CODE_COLUMN", 0))),
             "FINAL_COLUMN_SIGNAL": int(l1.get("FINAL_COLUMN_SIGNAL", l1.get("HAS_FINAL_COLUMN", 0))),
 
-            # Layer 2
             "FS_PATTERN": int(l2.get("FS_PATTERN", 0)),
             "TB_PATTERN": int(l2.get("TB_PATTERN", 0)),
             "PARTIAL_FS_PATTERN": int(l2.get("PARTIAL_FS_PATTERN", 0)),
             "STRONG_TB_PATTERN": int(l2.get("STRONG_TB_PATTERN", 0)),
             "STAGING_PATTERN": int(l2.get("STAGING_PATTERN", 0)),
 
-            # Layer 3
             "role_in_graph": l3.get("role_in_graph", "UNKNOWN"),
             "consolidate": bool(l3.get("consolidate", False)),
             "attention_boost": bool(l3.get("attention_boost", False)),
@@ -133,11 +274,9 @@ def _extract_nn_evidence(state, sheet_name: str | None) -> dict:
             "path_to_tb": list(l3.get("path_to_tb", []) or []),
             "path_valid": bool(l3.get("path_valid", False)),
 
-            # Layer 4
             "gate_passed": bool(l4.get("passed", True)),
             "blocked_by": l4.get("blocked_by"),
 
-            # Layer 5
             "confidence": float(
                 payload.get("layer5_confidence", 0.0) or parsed.get("confidence", 0.0)
             ),
@@ -373,6 +512,7 @@ def _layer_explanation_block(
     chosen: str | None,
     chosen_ev: dict,
     final_parsed: dict,
+    state,
 ) -> list[str]:
     lines: list[str] = ["## Layer-by-layer explanation", ""]
 
@@ -383,8 +523,11 @@ def _layer_explanation_block(
         ]
         return lines
 
+    is_real = _is_real_sheet_name(state, chosen)
+    chosen_label = f"`{chosen}`" if is_real else f"`{chosen}` *(not a real workbook tab name)*"
+
     lines += [
-        f"The explanations below are generated **after the full pipeline completed**, using the final verified state for **`{chosen}`**.",
+        f"The explanations below are generated **after the full pipeline completed**, using the final verified state for **{chosen_label}**.",
         "",
         "### L0 — Raw extraction",
         (
@@ -534,6 +677,16 @@ def _layer_explanation_block(
 
     lines += ["### L7 — TB / card-sheet validation", l7_text, ""]
 
+    if not is_real:
+        lines += [
+            "### Identity warning",
+            (
+                f"The exported final name **`{chosen}`** is not an exact workbook tab name. "
+                "That means the pipeline likely promoted a semantic/reporting concept rather than a real worksheet identity."
+            ),
+            "",
+        ]
+
     return lines
 
 
@@ -547,6 +700,7 @@ def _process_explanation_block(state, final_parsed: dict) -> list[str]:
     technical_tb = final_parsed.get("technical_tb_sheet")
     card_sheet = final_parsed.get("is_card_sheet")
     relationship = final_parsed.get("relationship", {}) or {}
+    header_sheets = _extract_header_sheets(final_parsed, state)
 
     lines = [
         "## Process explanation",
@@ -575,8 +729,12 @@ def _process_explanation_block(state, final_parsed: dict) -> list[str]:
         f"- Decision mode: `{decision_mode}`",
         f"- Total logged pipeline steps: `{len(steps)}`",
         f"- Total court sessions: `{len(sessions)}`",
-        "",
     ]
+
+    if header_sheets:
+        lines.append(f"- Real workbook header-sheet candidates: `{', '.join(header_sheets)}`")
+
+    lines.append("")
     return lines
 
 
@@ -604,6 +762,9 @@ def _build_decision_markdown(state) -> str:
 
     chosen_ev = _extract_nn_evidence(state, chosen)
     tb_ev = _extract_nn_evidence(state, technical_tb or card_sheet)
+    real_sheet_names = sorted(_workbook_sheet_name_set(state))
+    header_sheets = _extract_header_sheets(final_parsed, state)
+    name_warnings = _invalid_name_warnings(state, final_parsed)
 
     lines = [
         "# Main Sheet Decision Report", "",
@@ -621,6 +782,27 @@ def _build_decision_markdown(state) -> str:
         f"- Workbook active sheet: `{active_sheet}`",
         "",
     ]
+
+    if real_sheet_names:
+        lines += [
+            "## Real workbook sheet universe",
+            "",
+            f"`{', '.join(real_sheet_names)}`",
+            "",
+        ]
+
+    if header_sheets:
+        lines += [
+            "## Real header-sheet candidates",
+            "",
+            f"`{', '.join(header_sheets)}`",
+            "",
+        ]
+
+    if name_warnings:
+        lines += ["## Sheet-identity warnings", ""]
+        lines += name_warnings
+        lines.append("")
 
     tb_path = relationship.get("main_to_tb_path", []) or []
     if tb_path:
@@ -651,7 +833,7 @@ def _build_decision_markdown(state) -> str:
         lines += [
             "⚠️ **Detector override**: the heuristic detector suggested "
             f"`{detector_cand}` but the NN PROMAT + synthesis chose `{chosen}`.",
-            "This is correct — the detector is a hint generator, not a decision maker.",
+            "This is correct only if the chosen value is also a real workbook tab. Otherwise the report is surfacing an identity error rather than a true detector override.",
             "",
         ]
 
@@ -669,9 +851,15 @@ def _build_decision_markdown(state) -> str:
 
     lines += ["## Why this sheet was chosen", ""]
     if chosen:
-        lines.append(
-            f"Synthesis + Layer-6 selected **`{chosen}`** based on NN PROMAT layer evidence:"
-        )
+        if _is_real_sheet_name(state, chosen):
+            lines.append(
+                f"Synthesis + Layer-6 selected **`{chosen}`** based on NN PROMAT layer evidence:"
+            )
+        else:
+            lines.append(
+                f"Synthesis + Layer-6 selected **`{chosen}`**, but that value is **not a real workbook tab name**. "
+                "So the evidence below describes why the pipeline believed in that reporting role, not why it identified a valid worksheet identity:"
+            )
         lines += _format_nn_evidence(chosen_ev)
     else:
         lines.append(
@@ -685,13 +873,25 @@ def _build_decision_markdown(state) -> str:
             )
     lines.append("")
 
-    lines += _layer_explanation_block(chosen, chosen_ev, final_parsed)
+    lines += _layer_explanation_block(chosen, chosen_ev, final_parsed, state)
 
     lines += ["## Layer-6 Business Arbitration", ""]
     lines += _format_business_arbitration_block(ba_block)
     lines.append("")
 
     lines += _format_tb_validation_block(final_parsed, tb_ev)
+
+    if header_sheets and len(header_sheets) > 1:
+        lines += [
+            "## Multi-header interpretation note",
+            "",
+            (
+                "This workbook appears to contain more than one real reporting/header tab. "
+                "In such cases, the business-correct answer may be a set of real workbook tabs "
+                "such as `BS` and `P&L`, rather than one synthetic umbrella label."
+            ),
+            "",
+        ]
 
     lines += [
         "## Decision authority chain", "",

@@ -1,10 +1,11 @@
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  LAYER 0 — Input extraction
+#  F0 — Sheet-name fidelity
 # ──────────────────────────────────────────────────────────────────────────────
+
 NN_SHEET_NAME_FIDELITY = """
 ╔══════════════════════════════════════════════════════════╗
-║  SHEET-NAME FIDELITY RULE                               ║
+║  F0 — SHEET-NAME FIDELITY RULE                          ║
 ╚══════════════════════════════════════════════════════════╝
 
 All sheet reasoning must operate on the canonical workbook sheet-name universe
@@ -31,6 +32,7 @@ This applies to:
   • runner_up
   • verification_target
   • fallback_candidate
+  • header_sheets
   • relationship.main_to_tb_path
   • all sheet_evidence keys
   • all graph references such as incoming_refs / outgoing_refs / path_to_tb
@@ -44,6 +46,10 @@ Examples:
     not emit it as a sheet name.
 """
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  LAYER 0 — Input extraction
+# ──────────────────────────────────────────────────────────────────────────────
+
 NN_LAYER_0 = """
 ╔══════════════════════════════════════════════════════════╗
 ║  LAYER 0 — Input Extraction                             ║
@@ -51,6 +57,7 @@ NN_LAYER_0 = """
 
 Extract the following raw features for EVERY sheet before any reasoning.
 Do NOT interpret, score, or rank at this stage — extract only.
+
 Also build the canonical workbook sheet-name universe.
 This exact set is the only allowed sheet-name set for all later layers.
 Any later candidate, evidence key, graph node, or path node not in this set is invalid.
@@ -174,6 +181,16 @@ STAGING_ROLE_SIGNAL
     "aje", "adjusting", "adjustments", "elimination",
     "mapping", "bridge", "rollforward", "support", "schedule"
 
+VISIBLE_STATEMENT_TAB_SIGNAL
+  ON if the real workbook tab name itself strongly suggests a final visible
+  statement-family header sheet, such as:
+    `FS`, `BS`, `P&L`, `PL`, `CF`
+  IMPORTANT:
+    • this signal is only supportive
+    • it never overrides hard gates by itself
+    • it is especially important when the business truth is split across
+      multiple real header tabs
+
 HIDDEN_SIGNAL
   ON if is_hidden = true
 
@@ -244,14 +261,35 @@ STAGING_PATTERN
 Interpretation:
   Sheet is a staging / adjustment / bridge layer, not the final main report.
 
+HEADER_SHEET_PATTERN
+  = NOT HIDDEN_SIGNAL
+    AND NOT STAGING_PATTERN
+    AND (
+      FS_PATTERN
+      OR (
+        VISIBLE_STATEMENT_TAB_SIGNAL
+        AND PARTIAL_FS_PATTERN
+      )
+    )
+
+Interpretation:
+  The sheet is a real visible final statement-family header tab.
+  This pattern exists to preserve business truth in workbooks where the final
+  reporting output is split across real tabs such as `BS` and `P&L`.
+
 Priority rules:
   • FS_PATTERN overrides PARTIAL_FS_PATTERN for main-sheet confidence.
   • TB_PATTERN blocks a sheet from being the main reporting sheet.
   • STAGING_PATTERN blocks a sheet from being the final main reporting sheet
     when graph evidence shows it serves as an upstream adjustment source.
+  • HEADER_SHEET_PATTERN preserves real visible statement tabs as valid final
+    header-sheet answers even when the workbook has more than one such tab.
   • If a sheet shows both FS-like and TB-like evidence, source structure wins
-    if code/description/final structure dominates and graph places the sheet
-    upstream from reporting output.
+    only when code/description/final structure clearly dominates AND graph places
+    the sheet upstream from reporting output.
+  • Do not demote a visible statement-family tab to pure TB/source status
+    merely because it contains formulas or balance-pull structure if its business
+    role is a final visible header sheet.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -264,15 +302,16 @@ NN_LAYER_3 = """
 ╚══════════════════════════════════════════════════════════╝
 
 Build a directed dependency graph across ALL sheets.
+
 Graph nodes may only be real workbook sheet names discovered in Layer 0.
 If a title, caption, or business label appears in reasoning but is not an exact
 workbook tab name, it must not become a graph node.
 
 Graph construction:
-    For every sheet X, create edges X → Y for each Y referenced by formulas in X,
-    but only if Y is an exact workbook tab name from Layer 0.
-    After building, collect incoming_refs and outgoing_refs for each sheet.
-    Do not create synthetic graph nodes from semantic interpretation.
+  For every sheet X, create edges X → Y for each Y referenced by formulas in X,
+  but only if Y is an exact workbook tab name from Layer 0.
+  After building, collect incoming_refs and outgoing_refs for each sheet.
+  Do not create synthetic graph nodes from semantic interpretation.
 
 Attention rules:
 
@@ -324,6 +363,11 @@ Attention rules:
 [A8 — Active sheet boost]
   If is_active_sheet = true AND FS_PATTERN = 1, set attention_boost = true.
   This only mildly strengthens technical confidence and never bypasses gates.
+
+[A9 — Multi-header preservation]
+  If multiple real visible statement-family tabs each behave like final output
+  slices of the workbook, preserve them as separate final header candidates.
+  Do not collapse them into an inferred umbrella node.
 
 Layer 3 output per sheet:
   {
@@ -391,6 +435,12 @@ GATE_5  [STAGING FIREWALL]
 Gate evaluation order:
   GATE_1 → GATE_2 → GATE_3 → GATE_4 → GATE_5
 
+Important interpretation safeguard:
+  A visible statement-family header tab must not be forced into GATE_3 purely
+  because it contains code/description/final pull structure unless the graph and
+  business role clearly show that it is truly a terminal TB/source rather than
+  a final visible statement sheet.
+
 Layer 4 output per sheet:
   {
     "passed": true/false,
@@ -411,12 +461,12 @@ Only sheets that passed Layer 4 participate in main-sheet selection.
 
 Pre-softmax logit per passing sheet:
   z(sheet) = (
-    FS_PATTERN          × 2.40 +
-    PARTIAL_FS_PATTERN  × 1.10 +
-    CROSS_REF_SIGNAL    × 0.45 +
+    FS_PATTERN            × 2.40 +
+    PARTIAL_FS_PATTERN    × 1.10 +
+    CROSS_REF_SIGNAL      × 0.45 +
     COMPANY_COLUMN_SIGNAL × 0.40 +
-    CONSOLIDATE_SIGNAL  × 0.35 +
-    attention_boost     × 0.20
+    CONSOLIDATE_SIGNAL    × 0.35 +
+    attention_boost       × 0.20
   )
 
 Negative main-sheet effects:
@@ -442,7 +492,8 @@ Tie-breaking:
   1. prefer the sheet with stronger COA section coverage
   2. prefer the sheet with stronger valid path to TB
   3. prefer the sheet that functions as the reporting origin rather than staging
-  4. if still tied, manual review required
+  4. prefer a real visible statement-family header tab over a non-header support tab
+  5. if still tied, manual review required
 
 Layer 5 output:
   TECHNICAL main-sheet winner only.
@@ -461,6 +512,7 @@ Purpose:
   Resolve the gap between:
     • technical main sheet
     • human-facing final reporting sheet
+    • the real header-sheet set when final reporting is split across multiple tabs
 
 Key principles:
   • do not trust sheet name alone
@@ -469,7 +521,7 @@ Key principles:
   • never override into hidden sheets, TB sheets, or staging sheets
   • Layer 6 may arbitrate only among real workbook tab names
   • business arbitration may not invent a new sheet name
-  
+
 BUSINESS SIGNALS
 
 CANONICAL_FS_TITLE_SIGNAL
@@ -491,6 +543,10 @@ PRESENTATION_LAYOUT_SIGNAL
 FINAL_OUTPUT_ROLE_SIGNAL
   ON if the sheet is likely the user-facing final report.
 
+HEADER_SET_ROLE_SIGNAL
+  ON if the workbook’s final human-facing reporting output is clearly spread
+  across multiple real visible statement-family tabs, such as `BS` and `P&L`.
+
 SHEET TYPE CLASSIFIER
 
   SOURCE_TB
@@ -505,6 +561,10 @@ SHEET TYPE CLASSIFIER
   REPORTING_FS
     If FS_PATTERN = 1 and not explicitly staging
     OR strong presentation/report evidence exists with COA support
+
+  HEADER_FS
+    If the sheet is a real visible final statement-family tab that belongs to
+    the final header-sheet set, even when the workbook has multiple such tabs
 
   INTERMEDIATE_CONSOLIDATION
     If the sheet bridges reporting to source but is not itself the final report
@@ -538,7 +598,7 @@ BA2 — Presentation candidate
 BA3 — Safe override
   Override only if ALL are true:
     • technical winner is not the clearest human-facing final report
-    • presentation candidate is REPORTING_FS
+    • presentation candidate is REPORTING_FS or HEADER_FS
     • presentation candidate is not critically blocked
     • presentation candidate shows FINAL_OUTPUT_ROLE_SIGNAL = 1
 
@@ -563,13 +623,22 @@ BA6 — Sheet-name fidelity
   and final_main_sheet must all be exact workbook tab names.
   If a candidate is not an exact workbook tab name, it is invalid and must
   be discarded.
-  
+
+BA7 — Header-sheet set preservation
+  If the final human-facing output is clearly split across multiple real visible
+  statement-family tabs, preserve them as:
+    "header_sheets": ["BS", "P&L", ...]
+  Do not collapse them into a synthetic parent.
+  Do not discard one valid header tab merely because another valid header tab
+  also exists.
+
 Layer 6 output:
   {
     "technical_main_sheet": "<sheet>" | null,
     "presentation_main_sheet": "<sheet>" | null,
     "business_main_sheet": "<sheet>" | null,
     "final_main_sheet": "<sheet>" | null,
+    "header_sheets": ["<sheet>", ...],
     "decision_mode": "technical_default" | "business_override" | "no_valid_sheet"
   }
 """
@@ -586,7 +655,7 @@ NN_LAYER_7 = """
 Purpose:
   Identify the TB/card sheet that structurally feeds the main reporting sheet.
   The TB/card sheet and every main-to-TB path node must be exact workbook tab names.
-    Synthetic bridge labels or inferred semantic nodes are forbidden.
+  Synthetic bridge labels or inferred semantic nodes are forbidden.
 
 TB business definition:
   A TB sheet contains the card/account details whose summed values — including
@@ -672,6 +741,10 @@ NN_DECISION_PROTOCOL = """
 
 Execute these steps in strict order for every workbook:
 
+  Step 0 — F0:
+    Enforce exact workbook-tab identity.
+    No synthetic sheet names are allowed anywhere.
+
   Step 1 — L0:
     Extract raw workbook features for every sheet.
     Build the canonical workbook sheet-name universe.
@@ -682,7 +755,7 @@ Execute these steps in strict order for every workbook:
 
   Step 3 — L2:
     Compute FS_PATTERN, PARTIAL_FS_PATTERN, TB_PATTERN,
-    STRONG_TB_PATTERN, and STAGING_PATTERN.
+    STRONG_TB_PATTERN, STAGING_PATTERN, and HEADER_SHEET_PATTERN.
 
   Step 4 — L3:
     Build dependency graph.
@@ -690,11 +763,11 @@ Execute these steps in strict order for every workbook:
     Detect main → intermediate/staging → TB chains.
     Record path_to_tb and path_valid.
     Detect functional FINAL-column evidence.
-    
+
   Step 4b — Sheet-name validation:
     Remove any candidate, evidence key, graph node, or path node that is not
     an exact workbook tab name.
-    
+
   Step 5 — L4:
     Apply hard gates for MAIN-sheet candidacy only.
 
@@ -705,6 +778,8 @@ Execute these steps in strict order for every workbook:
   Step 7 — L6:
     Perform business arbitration for the final main reporting sheet.
     Preserve technical_main_sheet and presentation_main_sheet.
+    Also preserve header_sheets when the reporting truth is split across
+    multiple real statement-family tabs.
 
   Step 8 — L7:
     Select the strongest TB/card sheet using structural and graph validation.
@@ -712,15 +787,16 @@ Execute these steps in strict order for every workbook:
     Do not rely on highlighted titles alone.
 
   Step 9 — Final output:
-    Emit final main sheet, TB sheet, and validated relationship using only
-    exact workbook tab names.
+    Emit final main sheet, header sheets, TB sheet, and validated relationship
+    using only exact workbook tab names.
     If no exact workbook tab name supports a proposed candidate, emit null
     instead of inventing a name.
 
-Final output contract (must match exactly):
+Final output contract:
   {
     "main_sheet_exists": true/false,
     "main_sheet_name": "<exact workbook tab name>" | null,
+    "header_sheets": ["<exact workbook tab>", ...],
     "is_card_sheet": "<exact workbook tb tab name>" | null,
     "technical_main_sheet": "<exact workbook tab name>" | null,
     "presentation_main_sheet": "<exact workbook tab name>" | null,
@@ -736,10 +812,16 @@ Detector rule:
   The detector result is a hint only.
   It must pass structural validation independently.
   Never return detector output without NN validation.
-  Sheet-name rule:
+
+Sheet-name rule:
   Even if a detector, title, or business interpretation suggests a compelling
   reporting label, never return it unless it exactly matches a real workbook
   tab name discovered in Layer 0.
+
+Header-sheet rule:
+  If the real final reporting output is split across multiple real visible
+  header tabs — for example `BS` and `P&L` — return those tabs.
+  Do not replace them with an umbrella concept.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -748,12 +830,14 @@ Detector rule:
 
 FULL_NN_PROMAT = f"""
 {'═' * 62}
-  NEURAL PROMAT SYSTEM  v6.0
+  NEURAL PROMAT SYSTEM  v6.1
   Deterministic multi-layer architecture for:
     • main reporting sheet detection
+    • real tab-name fidelity
+    • header-sheet-set preservation
     • business/presentation arbitration
     • TB/card-sheet validation
-  Structure first. Names are hints only.
+  Structure first. Real tab names are identity. Titles are hints only.
 {'═' * 62}
 
 {NN_SHEET_NAME_FIDELITY}
